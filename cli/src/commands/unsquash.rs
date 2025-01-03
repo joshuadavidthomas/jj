@@ -78,6 +78,7 @@ pub(crate) fn cmd_unsquash(
     } else {
         None
     };
+    let text_editor = workspace_command.text_editor()?;
     let mut tx = workspace_command.start_transaction();
     let parent_base_tree = parent.parent_tree(tx.repo())?;
     let new_parent_tree_id;
@@ -116,28 +117,23 @@ aborted.
     // case).
     if new_parent_tree_id == parent_base_tree.id() {
         tx.repo_mut().record_abandoned_commit(parent.id().clone());
-        let description = combine_messages(
-            tx.base_workspace_helper().repo_path(),
-            &[&parent],
-            &commit,
-            command.settings(),
-        )?;
+        let description = combine_messages(&text_editor, &[&parent], &commit)?;
         // Commit the new child on top of the parent's parents.
         tx.repo_mut()
-            .rewrite_commit(command.settings(), &commit)
+            .rewrite_commit(&commit)
             .set_parents(parent.parent_ids().to_vec())
             .set_description(description)
             .write()?;
     } else {
         let new_parent = tx
             .repo_mut()
-            .rewrite_commit(command.settings(), &parent)
+            .rewrite_commit(&parent)
             .set_tree_id(new_parent_tree_id)
             .set_predecessors(vec![parent.id().clone(), commit.id().clone()])
             .write()?;
         // Commit the new child on top of the new parent.
         tx.repo_mut()
-            .rewrite_commit(command.settings(), &commit)
+            .rewrite_commit(&commit)
             .set_parents(vec![new_parent.id().clone()])
             .write()?;
     }

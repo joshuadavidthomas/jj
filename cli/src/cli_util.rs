@@ -21,7 +21,6 @@ use std::env::VarError;
 use std::ffi::OsString;
 use std::fmt;
 use std::fmt::Debug;
-use std::fs;
 use std::io;
 use std::io::Write as _;
 use std::iter;
@@ -149,17 +148,16 @@ use crate::command_error::internal_error_with_message;
 use crate::command_error::print_parse_diagnostics;
 use crate::command_error::user_error;
 use crate::command_error::user_error_with_hint;
-use crate::command_error::user_error_with_message;
 use crate::command_error::CommandError;
 use crate::commit_templater::CommitTemplateLanguage;
 use crate::commit_templater::CommitTemplateLanguageExtension;
 use crate::complete;
 use crate::config::config_from_environment;
 use crate::config::parse_config_args;
-use crate::config::CommandNameAndArgs;
 use crate::config::ConfigArgKind;
 use crate::config::ConfigEnv;
 use crate::config::RawConfig;
+use crate::description_util::TextEditor;
 use crate::diff_util;
 use crate::diff_util::DiffFormat;
 use crate::diff_util::DiffFormatArgs;
@@ -343,16 +341,13 @@ impl CommandHelper {
         &self.data.settings
     }
 
-    pub fn revset_extensions(&self) -> &Arc<RevsetExtensions> {
-        &self.data.revset_extensions
+    /// Loads text editor from the settings.
+    pub fn text_editor(&self) -> Result<TextEditor, ConfigGetError> {
+        TextEditor::from_settings(self.settings())
     }
 
-    /// Loads template aliases from the configs.
-    ///
-    /// For most commands that depend on a loaded repo, you should use
-    /// `WorkspaceCommandHelper::template_aliases_map()` instead.
-    fn load_template_aliases(&self, ui: &Ui) -> Result<TemplateAliasesMap, CommandError> {
-        load_template_aliases(ui, self.settings().config())
+    pub fn revset_extensions(&self) -> &Arc<RevsetExtensions> {
+        &self.data.revset_extensions
     }
 
     /// Parses template of the given language into evaluation tree.
@@ -368,7 +363,7 @@ impl CommandHelper {
         wrap_self: impl Fn(PropertyPlaceholder<C>) -> L::Property,
     ) -> Result<TemplateRenderer<'a, C>, CommandError> {
         let mut diagnostics = TemplateDiagnostics::new();
-        let aliases = self.load_template_aliases(ui)?;
+        let aliases = load_template_aliases(ui, self.settings().config())?;
         let template = template_builder::parse(
             language,
             &mut diagnostics,
@@ -586,14 +581,10 @@ impl CommandHelper {
                     )?;
                     let base_repo = repo_loader.load_at(&op_heads[0])?;
                     // TODO: It may be helpful to print each operation we're merging here
-                    let mut tx = start_repo_transaction(
-                        &base_repo,
-                        &self.data.settings,
-                        &self.data.string_args,
-                    );
+                    let mut tx = start_repo_transaction(&base_repo, &self.data.string_args);
                     for other_op_head in op_heads.into_iter().skip(1) {
                         tx.merge_operation(other_op_head)?;
-                        let num_rebased = tx.repo_mut().rebase_descendants(&self.data.settings)?;
+                        let num_rebased = tx.repo_mut().rebase_descendants()?;
                         if num_rebased > 0 {
                             writeln!(
                                 ui.status(),
@@ -736,7 +727,7 @@ impl WorkspaceCommandEnvironment {
     #[instrument(skip_all)]
     fn new(ui: &Ui, command: &CommandHelper, workspace: &Workspace) -> Result<Self, CommandError> {
         let revset_aliases_map = revset_util::load_revset_aliases(ui, command.settings().config())?;
-        let template_aliases_map = command.load_template_aliases(ui)?;
+        let template_aliases_map = load_template_aliases(ui, command.settings().config())?;
         let path_converter = RepoPathUiConverter::Fs {
             cwd: command.cwd().to_owned(),
             base: workspace.workspace_root().to_owned(),
@@ -1059,7 +1050,6 @@ impl WorkspaceCommandHelper {
     #[instrument(skip_all)]
     fn import_git_head(&mut self, ui: &Ui) -> Result<(), CommandError> {
         assert!(self.may_update_working_copy);
-        let command = self.env.command.clone();
         let mut tx = self.start_transaction();
         git::import_head(tx.repo_mut())?;
         if !tx.repo().has_changes() {
@@ -1083,13 +1073,13 @@ impl WorkspaceCommandHelper {
             let workspace_id = self.workspace_id().to_owned();
             let new_git_head_commit = tx.repo().store().get_commit(new_git_head_id)?;
             tx.repo_mut()
-                .check_out(workspace_id, command.settings(), &new_git_head_commit)?;
+                .check_out(workspace_id, &new_git_head_commit)?;
             let mut locked_ws = self.workspace.start_working_copy_mutation()?;
             // The working copy was presumably updated by the git command that updated
             // HEAD, so we just need to reset our working copy
             // state to it without updating working copy files.
             locked_ws.locked_wc().reset(&new_git_head_commit)?;
-            tx.repo_mut().rebase_descendants(command.settings())?;
+            tx.repo_mut().rebase_descendants()?;
             self.user_repo = ReadonlyUserRepo::new(tx.commit("import git head")?);
             locked_ws.finish(self.user_repo.repo.op_id().clone())?;
             if old_git_head.is_present() {
@@ -1130,7 +1120,7 @@ impl WorkspaceCommandHelper {
         print_git_import_stats(ui, tx.repo(), &stats, false)?;
         let mut tx = tx.into_inner();
         // Rebase here to show slightly different status message.
-        let num_rebased = tx.repo_mut().rebase_descendants(self.settings())?;
+        let num_rebased = tx.repo_mut().rebase_descendants()?;
         if num_rebased > 0 {
             writeln!(
                 ui.status(),
@@ -1205,7 +1195,6 @@ impl WorkspaceCommandHelper {
             locked_ws.locked_wc(),
             &self.user_repo.repo,
             workspace_id,
-            self.env.settings(),
             "RECOVERY COMMIT FROM `jj workspace update-stale`
 
 This commit contains changes that were written to the working copy by an
@@ -1463,6 +1452,13 @@ to the current parents may contain changes from multiple commits.
         } else {
             MergeEditor::from_settings(ui, self.settings(), conflict_marker_style)
         }
+    }
+
+    /// Loads text editor from the settings.
+    ///
+    /// Temporary files will be created in the repository directory.
+    pub fn text_editor(&self) -> Result<TextEditor, ConfigGetError> {
+        Ok(TextEditor::from_settings(self.settings())?.with_temp_dir(self.repo_path()))
     }
 
     pub fn resolve_single_op(&self, op_str: &str) -> Result<Operation, OpsetEvaluationError> {
@@ -1783,7 +1779,6 @@ to the current parents may contain changes from multiple commits.
             .map_err(snapshot_command_error)?;
 
         // Compare working-copy tree and operation with repo's, and reload as needed.
-        let command = self.env.command.clone();
         let mut locked_ws = self
             .workspace
             .start_working_copy_mutation()
@@ -1851,15 +1846,12 @@ See https://jj-vcs.github.io/jj/latest/working-copy/#stale-working-copy \
                 .map_err(snapshot_command_error)?
         };
         if new_tree_id != *wc_commit.tree_id() {
-            let mut tx = start_repo_transaction(
-                &self.user_repo.repo,
-                command.settings(),
-                command.string_args(),
-            );
+            let mut tx =
+                start_repo_transaction(&self.user_repo.repo, self.env.command.string_args());
             tx.set_is_snapshot(true);
             let mut_repo = tx.repo_mut();
             let commit = mut_repo
-                .rewrite_commit(command.settings(), &wc_commit)
+                .rewrite_commit(&wc_commit)
                 .set_tree_id(new_tree_id)
                 .write()
                 .map_err(snapshot_command_error)?;
@@ -1869,7 +1861,7 @@ See https://jj-vcs.github.io/jj/latest/working-copy/#stale-working-copy \
 
             // Rebase descendants
             let num_rebased = mut_repo
-                .rebase_descendants(command.settings())
+                .rebase_descendants()
                 .map_err(snapshot_command_error)?;
             if num_rebased > 0 {
                 writeln!(
@@ -1943,8 +1935,7 @@ See https://jj-vcs.github.io/jj/latest/working-copy/#stale-working-copy \
     }
 
     pub fn start_transaction(&mut self) -> WorkspaceCommandTransaction {
-        let tx =
-            start_repo_transaction(self.repo(), self.settings(), self.env.command.string_args());
+        let tx = start_repo_transaction(self.repo(), self.env.command.string_args());
         let id_prefix_context = mem::take(&mut self.user_repo.id_prefix_context);
         WorkspaceCommandTransaction {
             helper: self,
@@ -1963,7 +1954,7 @@ See https://jj-vcs.github.io/jj/latest/working-copy/#stale-working-copy \
             writeln!(ui.status(), "Nothing changed.")?;
             return Ok(());
         }
-        let num_rebased = tx.repo_mut().rebase_descendants(self.settings())?;
+        let num_rebased = tx.repo_mut().rebase_descendants()?;
         if num_rebased > 0 {
             writeln!(ui.status(), "Rebased {num_rebased} descendant commits")?;
         }
@@ -1977,8 +1968,7 @@ See https://jj-vcs.github.io/jj/latest/working-copy/#stale-working-copy \
                 .is_some()
             {
                 let wc_commit = tx.repo().store().get_commit(wc_commit_id)?;
-                tx.repo_mut()
-                    .check_out(workspace_id.clone(), self.settings(), &wc_commit)?;
+                tx.repo_mut().check_out(workspace_id.clone(), &wc_commit)?;
                 writeln!(
                     ui.warning_default(),
                     "The working-copy commit in workspace '{}' became immutable, so a new commit \
@@ -2298,9 +2288,8 @@ impl WorkspaceCommandTransaction<'_> {
 
     pub fn check_out(&mut self, commit: &Commit) -> Result<Commit, CheckOutCommitError> {
         let workspace_id = self.helper.workspace_id().to_owned();
-        let settings = self.helper.settings();
         self.id_prefix_context.take(); // invalidate
-        self.tx.repo_mut().check_out(workspace_id, settings, commit)
+        self.tx.repo_mut().check_out(workspace_id, commit)
     }
 
     pub fn edit(&mut self, commit: &Commit) -> Result<(), EditCommitError> {
@@ -2434,12 +2423,8 @@ jj git init --colocate",
     }
 }
 
-pub fn start_repo_transaction(
-    repo: &Arc<ReadonlyRepo>,
-    settings: &UserSettings,
-    string_args: &[String],
-) -> Transaction {
-    let mut tx = repo.start_transaction(settings);
+pub fn start_repo_transaction(repo: &Arc<ReadonlyRepo>, string_args: &[String]) -> Transaction {
+    let mut tx = repo.start_transaction();
     // TODO: Either do better shell-escaping here or store the values in some list
     // type (which we currently don't have).
     let shell_escape = |arg: &String| {
@@ -2849,73 +2834,6 @@ impl LogContentFormat {
         }
         Ok(())
     }
-}
-
-pub fn run_ui_editor(settings: &UserSettings, edit_path: &Path) -> Result<(), CommandError> {
-    let editor: CommandNameAndArgs = settings.get("ui.editor")?;
-    let mut cmd = editor.to_command();
-    cmd.arg(edit_path);
-    tracing::info!(?cmd, "running editor");
-    let exit_status = cmd.status().map_err(|err| {
-        user_error_with_message(
-            format!(
-                // The executable couldn't be found or run; command-line arguments are not relevant
-                "Failed to run editor '{name}'",
-                name = editor.split_name(),
-            ),
-            err,
-        )
-    })?;
-    if !exit_status.success() {
-        return Err(user_error(format!(
-            "Editor '{editor}' exited with an error"
-        )));
-    }
-
-    Ok(())
-}
-
-pub fn edit_temp_file(
-    error_name: &str,
-    tempfile_suffix: &str,
-    dir: &Path,
-    content: &str,
-    settings: &UserSettings,
-) -> Result<String, CommandError> {
-    let path = (|| -> Result<_, io::Error> {
-        let mut file = tempfile::Builder::new()
-            .prefix("editor-")
-            .suffix(tempfile_suffix)
-            .tempfile_in(dir)?;
-        file.write_all(content.as_bytes())?;
-        let (_, path) = file.keep().map_err(|e| e.error)?;
-        Ok(path)
-    })()
-    .map_err(|e| {
-        user_error_with_message(
-            format!(
-                r#"Failed to create {} file in "{}""#,
-                error_name,
-                dir.display(),
-            ),
-            e,
-        )
-    })?;
-
-    run_ui_editor(settings, &path)?;
-
-    let edited = fs::read_to_string(&path).map_err(|e| {
-        user_error_with_message(
-            format!(r#"Failed to read {} file "{}""#, error_name, path.display()),
-            e,
-        )
-    })?;
-
-    // Delete the file only if everything went well.
-    // TODO: Tell the user the name of the file we left behind.
-    std::fs::remove_file(path).ok();
-
-    Ok(edited)
 }
 
 pub fn short_commit_hash(commit_id: &CommitId) -> String {

@@ -12,34 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::io::Write as _;
+use std::path::Path;
+
 use tracing::instrument;
 
-use super::ConfigLevelArgs;
 use crate::cli_util::CommandHelper;
 use crate::command_error::CommandError;
 use crate::ui::Ui;
 
-/// Start an editor on a jj config file.
+/// List the patterns that are currently present in the working copy
 ///
-/// Creates the file if it doesn't already exist regardless of what the editor
-/// does.
+/// By default, a newly cloned or initialized repo will have have a pattern
+/// matching all files from the repo root. That pattern is rendered as `.` (a
+/// single period).
 #[derive(clap::Args, Clone, Debug)]
-pub struct ConfigEditArgs {
-    #[command(flatten)]
-    pub level: ConfigLevelArgs,
-}
+pub struct SparseListArgs {}
 
 #[instrument(skip_all)]
-pub fn cmd_config_edit(
-    _ui: &mut Ui,
+pub fn cmd_sparse_list(
+    ui: &mut Ui,
     command: &CommandHelper,
-    args: &ConfigEditArgs,
+    _args: &SparseListArgs,
 ) -> Result<(), CommandError> {
-    let editor = command.text_editor()?;
-    let file = args.level.edit_config_file(command)?;
-    if !file.path().exists() {
-        file.save()?;
+    let workspace_command = command.workspace_helper(ui)?;
+    for path in workspace_command.working_copy().sparse_patterns()? {
+        writeln!(
+            ui.stdout(),
+            "{}",
+            path.to_fs_path_unchecked(Path::new("")).display()
+        )?;
     }
-    editor.edit_file(file.path())?;
     Ok(())
 }

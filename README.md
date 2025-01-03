@@ -138,6 +138,12 @@ use the bridge to follow IRC.
 
 ### News and Updates 📣
 
+- **December 2024**: The `jj` Repository has moved to the `jj-vcs` GitHub
+  organisation.
+- **November 2024**: Version 0.24 is released which adds `jj file annotate`,
+  which is equivalent to `git blame` or `hg annotate`.
+- **September 2024**: Martin gave a [presentation about Jujutsu][merge-vid-2024] at
+  Git Merge 2024.
 - **Feb 2024**: Version 0.14 is released, which deprecates ["jj checkout" and "jj merge"](CHANGELOG.md#0140---2024-02-07),
   as well as `jj init --git`, which is now just called `jj git init`.
 - **Oct 2023**: Version 0.10.0 is released! Now includes a bundled merge and
@@ -165,6 +171,7 @@ The wiki also contains a more extensive list of [media references][wiki-media].
 [lwn]: https://lwn.net/Articles/958468/
 [merge-talk]: https://www.youtube.com/watch?v=bx_LGilOuE4
 [merge-slides]: https://docs.google.com/presentation/d/1F8j9_UOOSGUN9MvHxPZX_L4bQ9NMcYOp1isn17kTC_M/view
+[merge-vid-2024]: https://www.youtube.com/watch?v=LV0JzI8IcCY
 [wiki-media]: https://github.com/jj-vcs/jj/wiki/Media
 
 ## Getting started
@@ -296,8 +303,8 @@ commit to any other commit using `jj squash -i --from X --into Y`.
 
 ## Status
 
-The tool is fairly feature-complete, but some important features like (the
-equivalent of) `git blame` are not yet supported. There
+The tool is fairly feature-complete, but some important features like support
+for Git submodules are not yet completed. There
 are also several performance bugs. It's likely that workflows and setups
 different from what the core developers use are not well supported, e.g. there
 is no native support for email-based workflows.

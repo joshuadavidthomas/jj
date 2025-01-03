@@ -12,34 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use jj_lib::repo_path::RepoPathBuf;
 use tracing::instrument;
 
-use super::ConfigLevelArgs;
+use super::update_sparse_patterns_with;
 use crate::cli_util::CommandHelper;
 use crate::command_error::CommandError;
 use crate::ui::Ui;
 
-/// Start an editor on a jj config file.
-///
-/// Creates the file if it doesn't already exist regardless of what the editor
-/// does.
+/// Reset the patterns to include all files in the working copy
 #[derive(clap::Args, Clone, Debug)]
-pub struct ConfigEditArgs {
-    #[command(flatten)]
-    pub level: ConfigLevelArgs,
-}
+pub struct SparseResetArgs {}
 
 #[instrument(skip_all)]
-pub fn cmd_config_edit(
-    _ui: &mut Ui,
+pub fn cmd_sparse_reset(
+    ui: &mut Ui,
     command: &CommandHelper,
-    args: &ConfigEditArgs,
+    _args: &SparseResetArgs,
 ) -> Result<(), CommandError> {
-    let editor = command.text_editor()?;
-    let file = args.level.edit_config_file(command)?;
-    if !file.path().exists() {
-        file.save()?;
-    }
-    editor.edit_file(file.path())?;
-    Ok(())
+    let mut workspace_command = command.workspace_helper(ui)?;
+    update_sparse_patterns_with(ui, &mut workspace_command, |_ui, _old_patterns| {
+        Ok(vec![RepoPathBuf::root()])
+    })
 }

@@ -139,7 +139,19 @@ fn test_describe() {
     // Fails if the editor fails
     std::fs::write(&edit_script, "fail").unwrap();
     let stderr = test_env.jj_cmd_failure(&repo_path, &["describe"]);
-    assert!(stderr.contains("exited with an error"));
+    insta::with_settings!({
+        filters => [
+            (r"\bEditor '[^']*'", "Editor '<redacted>'"),
+            (r"\b(editor-)[^.]*(\.jjdescription)\b", "$1<redacted>$2"),
+            ("exit code", "exit status"), // Windows
+        ],
+    }, {
+        insta::assert_snapshot!(stderr, @r"
+        Error: Failed to edit description
+        Caused by: Editor '<redacted>' exited with exit status: 1
+        Hint: Edited description is left in $TEST_ENV/repo/.jj/repo/editor-<redacted>.jjdescription
+        ");
+    });
 
     // ignore everything after the first ignore-rest line
     std::fs::write(
@@ -174,7 +186,7 @@ fn test_describe() {
 #[test]
 fn test_describe_editor_env() {
     let test_env = TestEnvironment::default();
-    test_env.jj_cmd_ok(test_env.env_root(), &["init", "repo", "--git"]);
+    test_env.jj_cmd_ok(test_env.env_root(), &["git", "init", "repo"]);
     let repo_path = test_env.env_root().join("repo");
 
     // Fails if the editor doesn't exist
@@ -412,7 +424,19 @@ fn test_describe_multiple_commits() {
     // Fails if the editor fails
     std::fs::write(&edit_script, "fail").unwrap();
     let stderr = test_env.jj_cmd_failure(&repo_path, &["describe", "@", "@-"]);
-    assert!(stderr.contains("exited with an error"));
+    insta::with_settings!({
+        filters => [
+            (r"\bEditor '[^']*'", "Editor '<redacted>'"),
+            (r"\b(editor-)[^.]*(\.jjdescription)\b", "$1<redacted>$2"),
+            ("exit code", "exit status"), // Windows
+        ],
+    }, {
+        insta::assert_snapshot!(stderr, @r"
+        Error: Failed to edit description
+        Caused by: Editor '<redacted>' exited with exit status: 1
+        Hint: Edited description is left in $TEST_ENV/repo/.jj/repo/editor-<redacted>.jjdescription
+        ");
+    });
 
     // describe lines should take priority over ignore-rest
     std::fs::write(

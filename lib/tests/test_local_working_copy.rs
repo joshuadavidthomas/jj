@@ -42,7 +42,6 @@ use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::repo_path::RepoPathComponent;
 use jj_lib::secret_backend::SecretBackend;
-use jj_lib::settings::UserSettings;
 use jj_lib::working_copy::CheckoutError;
 use jj_lib::working_copy::CheckoutOptions;
 use jj_lib::working_copy::CheckoutStats;
@@ -151,7 +150,6 @@ fn test_checkout_file_transitions(backend: TestRepoBackend) {
     }
 
     fn write_path(
-        settings: &UserSettings,
         repo: &Arc<ReadonlyRepo>,
         tree_builder: &mut MergedTreeBuilder,
         kind: Kind,
@@ -241,8 +239,8 @@ fn test_checkout_file_transitions(backend: TestRepoBackend) {
                 return;
             }
             Kind::GitSubmodule => {
-                let mut tx = repo.start_transaction(settings);
-                let id = write_random_commit(tx.repo_mut(), settings).id().clone();
+                let mut tx = repo.start_transaction();
+                let id = write_random_commit(tx.repo_mut()).id().clone();
                 tx.commit("test").unwrap();
                 Merge::normal(TreeValue::GitSubmodule(id))
             }
@@ -269,8 +267,8 @@ fn test_checkout_file_transitions(backend: TestRepoBackend) {
     for left_kind in &kinds {
         for right_kind in &kinds {
             let path = RepoPathBuf::from_internal_string(format!("{left_kind:?}_{right_kind:?}"));
-            write_path(&settings, repo, &mut left_tree_builder, *left_kind, &path);
-            write_path(&settings, repo, &mut right_tree_builder, *right_kind, &path);
+            write_path(repo, &mut left_tree_builder, *left_kind, &path);
+            write_path(repo, &mut right_tree_builder, *right_kind, &path);
             files.push((*left_kind, *right_kind, path.clone()));
         }
     }
@@ -1305,7 +1303,7 @@ fn test_git_submodule() {
     let repo = test_workspace.repo.clone();
     let store = repo.store().clone();
     let workspace_root = test_workspace.workspace.workspace_root().to_owned();
-    let mut tx = repo.start_transaction(&settings);
+    let mut tx = repo.start_transaction();
 
     let added_path = RepoPath::from_internal_string("added");
     let submodule_path = RepoPath::from_internal_string("submodule");
@@ -1321,7 +1319,7 @@ fn test_git_submodule() {
         }),
     );
 
-    let submodule_id1 = write_random_commit(tx.repo_mut(), &settings).id().clone();
+    let submodule_id1 = write_random_commit(tx.repo_mut()).id().clone();
 
     tree_builder.set_or_remove(
         submodule_path.to_owned(),
@@ -1332,7 +1330,7 @@ fn test_git_submodule() {
     let commit1 = commit_with_tree(repo.store(), tree_id1.clone());
 
     let mut tree_builder = MergedTreeBuilder::new(tree_id1.clone());
-    let submodule_id2 = write_random_commit(tx.repo_mut(), &settings).id().clone();
+    let submodule_id2 = write_random_commit(tx.repo_mut()).id().clone();
     tree_builder.set_or_remove(
         submodule_path.to_owned(),
         Merge::normal(TreeValue::GitSubmodule(submodule_id2)),

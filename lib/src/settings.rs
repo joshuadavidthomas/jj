@@ -14,7 +14,6 @@
 
 #![allow(missing_docs)]
 
-use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -40,19 +39,19 @@ use crate::signing::SignBehavior;
 
 #[derive(Debug, Clone)]
 pub struct UserSettings {
-    config: StackedConfig,
+    config: Arc<StackedConfig>,
+    data: Arc<UserSettingsData>,
+    rng: Arc<JJRng>,
+}
+
+#[derive(Debug)]
+struct UserSettingsData {
     user_name: String,
     user_email: String,
     commit_timestamp: Option<Timestamp>,
     operation_timestamp: Option<Timestamp>,
     operation_hostname: String,
     operation_username: String,
-    rng: Arc<JJRng>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RepoSettings {
-    _config: StackedConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -153,46 +152,35 @@ impl UserSettings {
         let operation_timestamp = config
             .get_value_with("debug.operation-timestamp", to_timestamp)
             .optional()?;
-        // whoami::fallible::*() failure isn't a ConfigGetError, but user would
-        // have to set the corresponding config keys if these parameter can't be
-        // obtained from the system. Instead of handling environment data here,
-        // it might be better to load them by CLI and insert as a config layer.
+        // Instead of handling environment data here, it might be better to load
+        // them by CLI and insert as a config layer.
+        // TODO: warn empty hostname/username by CLI?
         let operation_hostname = config
             .get("operation.hostname")
             .optional()?
             .map_or_else(whoami::fallible::hostname, Ok)
-            .map_err(|err| ConfigGetError::Type {
-                name: "operation.hostname".to_owned(),
-                error: err.into(),
-                source_path: None,
-            })?;
+            .inspect_err(|err| tracing::warn!(?err, "operation.hostname couldn't be set"))
+            .unwrap_or_default();
         let operation_username = config
             .get("operation.username")
             .optional()?
             .map_or_else(whoami::fallible::username, Ok)
-            .map_err(|err| ConfigGetError::Type {
-                name: "operation.username".to_owned(),
-                error: err.into(),
-                source_path: None,
-            })?;
-        let rng_seed = config.get::<u64>("debug.randomness-seed").optional()?;
-        Ok(UserSettings {
-            config,
+            .inspect_err(|err| tracing::warn!(?err, "operation.username couldn't be set"))
+            .unwrap_or_default();
+        let data = UserSettingsData {
             user_name,
             user_email,
             commit_timestamp,
             operation_timestamp,
             operation_hostname,
             operation_username,
+        };
+        let rng_seed = config.get::<u64>("debug.randomness-seed").optional()?;
+        Ok(UserSettings {
+            config: Arc::new(config),
+            data: Arc::new(data),
             rng: Arc::new(JJRng::new(rng_seed)),
         })
-    }
-
-    // TODO: Reconsider UserSettings/RepoSettings abstraction. See
-    // https://github.com/jj-vcs/jj/issues/616#issuecomment-1345170699
-    pub fn with_repo(&self, _repo_path: &Path) -> RepoSettings {
-        let config = self.config.clone();
-        RepoSettings { _config: config }
     }
 
     pub fn get_rng(&self) -> Arc<JJRng> {
@@ -200,14 +188,14 @@ impl UserSettings {
     }
 
     pub fn user_name(&self) -> &str {
-        &self.user_name
+        &self.data.user_name
     }
 
     // Must not be changed to avoid git pushing older commits with no set name
     pub const USER_NAME_PLACEHOLDER: &'static str = "(no name configured)";
 
     pub fn user_email(&self) -> &str {
-        &self.user_email
+        &self.data.user_email
     }
 
     pub fn fsmonitor_settings(&self) -> Result<FsmonitorSettings, ConfigGetError> {
@@ -219,23 +207,23 @@ impl UserSettings {
     pub const USER_EMAIL_PLACEHOLDER: &'static str = "(no email configured)";
 
     pub fn commit_timestamp(&self) -> Option<Timestamp> {
-        self.commit_timestamp
+        self.data.commit_timestamp
     }
 
     pub fn operation_timestamp(&self) -> Option<Timestamp> {
-        self.operation_timestamp
+        self.data.operation_timestamp
     }
 
     pub fn operation_hostname(&self) -> &str {
-        &self.operation_hostname
+        &self.data.operation_hostname
     }
 
     pub fn operation_username(&self) -> &str {
-        &self.operation_username
+        &self.data.operation_username
     }
 
     pub fn signature(&self) -> Signature {
-        let timestamp = self.commit_timestamp.unwrap_or_else(Timestamp::now);
+        let timestamp = self.data.commit_timestamp.unwrap_or_else(Timestamp::now);
         Signature {
             name: self.user_name().to_owned(),
             email: self.user_email().to_owned(),

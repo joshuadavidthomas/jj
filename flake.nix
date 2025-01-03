@@ -127,9 +127,9 @@
             installManPage ./jj.1
 
             installShellCompletion --cmd jj \
-              --bash <($out/bin/jj util completion bash) \
-              --fish <($out/bin/jj util completion fish) \
-              --zsh <($out/bin/jj util completion zsh)
+              --bash <(COMPLETE=bash $out/bin/jj) \
+              --fish <(COMPLETE=fish $out/bin/jj) \
+              --zsh <(COMPLETE=zsh $out/bin/jj)
           '';
 
           meta = {
@@ -161,6 +161,7 @@
       });
 
       devShells.default = pkgs.mkShell {
+        name = "jujutsu";
         packages = with pkgs; [
           # NOTE (aseipp): explicitly add rust-src to the rustc compiler only in
           # devShell. this in turn causes a dependency on the rust compiler src,

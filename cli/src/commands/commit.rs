@@ -87,6 +87,7 @@ pub(crate) fn cmd_commit(
     let advanceable_bookmarks = workspace_command.get_advanceable_bookmarks(commit.parent_ids())?;
     let diff_selector =
         workspace_command.diff_selector(ui, args.tool.as_deref(), args.interactive)?;
+    let text_editor = workspace_command.text_editor()?;
     let mut tx = workspace_command.start_transaction();
     let base_tree = commit.parent_tree(tx.repo())?;
     let format_instructions = || {
@@ -115,10 +116,7 @@ new working-copy commit.
         )?;
     }
 
-    let mut commit_builder = tx
-        .repo_mut()
-        .rewrite_commit(command.settings(), &commit)
-        .detach();
+    let mut commit_builder = tx.repo_mut().rewrite_commit(&commit).detach();
     commit_builder.set_tree_id(tree_id);
     if args.reset_author {
         commit_builder.set_author(commit_builder.committer().clone());
@@ -141,11 +139,7 @@ new working-copy commit.
         }
         let temp_commit = commit_builder.write_hidden()?;
         let template = description_template(ui, &tx, "", &temp_commit)?;
-        edit_description(
-            tx.base_workspace_helper().repo_path(),
-            &template,
-            command.settings(),
-        )?
+        edit_description(&text_editor, &template)?
     };
     commit_builder.set_description(description);
     let new_commit = commit_builder.write(tx.repo_mut())?;
@@ -154,11 +148,7 @@ new working-copy commit.
     if !workspace_ids.is_empty() {
         let new_wc_commit = tx
             .repo_mut()
-            .new_commit(
-                command.settings(),
-                vec![new_commit.id().clone()],
-                commit.tree_id().clone(),
-            )
+            .new_commit(vec![new_commit.id().clone()], commit.tree_id().clone())
             .write()?;
 
         // Does nothing if there's no bookmarks to advance.

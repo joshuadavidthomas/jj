@@ -110,6 +110,7 @@ pub(crate) fn cmd_describe(
         return Ok(());
     }
     workspace_command.check_rewritable(commits.iter().ids())?;
+    let text_editor = workspace_command.text_editor()?;
 
     let mut tx = workspace_command.start_transaction();
     let tx_description = if commits.len() == 1 {
@@ -148,10 +149,7 @@ pub(crate) fn cmd_describe(
             // Edit descriptions in topological order
             .rev()
             .map(|commit| -> Result<_, CommandError> {
-                let mut commit_builder = tx
-                    .repo_mut()
-                    .rewrite_commit(command.settings(), commit)
-                    .detach();
+                let mut commit_builder = tx.repo_mut().rewrite_commit(commit).detach();
                 if commit_builder.description().is_empty() {
                     commit_builder
                         .set_description(command.settings().get_string("ui.default-description")?);
@@ -175,12 +173,7 @@ pub(crate) fn cmd_describe(
 
         if let [(_, temp_commit)] = &*temp_commits {
             let template = description_template(ui, &tx, "", temp_commit)?;
-            let description = edit_description(
-                tx.base_workspace_helper().repo_path(),
-                &template,
-                command.settings(),
-            )?;
-
+            let description = edit_description(&text_editor, &template)?;
             vec![(&commits[0], description)]
         } else {
             let ParsedBulkEditMessage {
@@ -188,7 +181,7 @@ pub(crate) fn cmd_describe(
                 missing,
                 duplicates,
                 unexpected,
-            } = edit_multiple_descriptions(ui, &tx, &temp_commits, command.settings())?;
+            } = edit_multiple_descriptions(ui, &text_editor, &tx, &temp_commits)?;
             if !missing.is_empty() {
                 return Err(user_error(format!(
                     "The description for the following commits were not found in the edited \
@@ -244,14 +237,13 @@ pub(crate) fn cmd_describe(
     // rewriting the same commit multiple times, and adding additional entries
     // in the predecessor chain.
     tx.repo_mut().transform_descendants(
-        command.settings(),
         commit_descriptions
             .keys()
             .map(|&id| id.clone())
             .collect_vec(),
         |rewriter| {
             let old_commit_id = rewriter.old_commit().id().clone();
-            let mut commit_builder = rewriter.rebase(command.settings())?;
+            let mut commit_builder = rewriter.rebase()?;
             if let Some(description) = commit_descriptions.get(&old_commit_id) {
                 commit_builder = commit_builder.set_description(description);
                 if args.reset_author {
