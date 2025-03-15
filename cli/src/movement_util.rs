@@ -191,17 +191,17 @@ fn get_target_commit(
 }
 
 fn choose_commit<'a>(
-    ui: &mut Ui,
+    ui: &Ui,
     workspace_command: &WorkspaceCommandHelper,
     direction: Direction,
     commits: &'a [Commit],
 ) -> Result<&'a Commit, CommandError> {
     writeln!(
-        ui.stdout(),
+        ui.stderr(),
         "ambiguous {} commit, choose one to target:",
         direction.cmd()
     )?;
-    let mut formatter = ui.stdout_formatter();
+    let mut formatter = ui.stderr_formatter();
     let template = workspace_command.commit_summary_template();
     let mut choices: Vec<String> = Default::default();
     for (i, commit) in commits.iter().enumerate() {
@@ -214,16 +214,14 @@ fn choose_commit<'a>(
     choices.push("q".to_string());
     drop(formatter);
 
-    let choice = ui.prompt_choice(
+    let index = ui.prompt_choice(
         "enter the index of the commit you want to target",
         &choices,
         None,
     )?;
-    if choice == "q" {
-        return Err(user_error("ambiguous target commit"));
-    }
-
-    Ok(&commits[choice.parse::<usize>().unwrap() - 1])
+    commits
+        .get(index)
+        .ok_or_else(|| user_error("ambiguous target commit"))
 }
 
 pub(crate) fn move_to_commit(
