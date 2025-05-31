@@ -17,10 +17,12 @@
 use std::cmp::max;
 use std::cmp::min;
 use std::cmp::Ordering;
+use std::collections::binary_heap;
 use std::collections::BTreeSet;
 use std::collections::BinaryHeap;
 use std::collections::HashSet;
 use std::iter;
+use std::mem;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -317,36 +319,34 @@ impl CompositeIndex {
         set1: &[IndexPosition],
         set2: &[IndexPosition],
     ) -> BTreeSet<IndexPosition> {
-        let mut items1: BinaryHeap<_> = set1
-            .iter()
-            .map(|pos| IndexPositionByGeneration::from(&self.entry_by_pos(*pos)))
-            .collect();
-        let mut items2: BinaryHeap<_> = set2
-            .iter()
-            .map(|pos| IndexPositionByGeneration::from(&self.entry_by_pos(*pos)))
-            .collect();
+        fn shift_to_parents(
+            index: &CompositeIndex,
+            items: &mut BinaryHeap<IndexPosition>,
+            cur_pos: IndexPosition,
+        ) {
+            let mut parent_positions = index.entry_by_pos(cur_pos).parent_positions().into_iter();
+            if let Some(parent_pos) = parent_positions.next() {
+                assert!(parent_pos < cur_pos);
+                dedup_replace(items, parent_pos).unwrap();
+            } else {
+                dedup_pop(items).unwrap();
+                return;
+            }
+            for parent_pos in parent_positions {
+                assert!(parent_pos < cur_pos);
+                items.push(parent_pos);
+            }
+        }
 
+        let mut items1: BinaryHeap<_> = set1.iter().copied().collect();
+        let mut items2: BinaryHeap<_> = set2.iter().copied().collect();
         let mut result = BTreeSet::new();
-        while let (Some(item1), Some(item2)) = (items1.peek(), items2.peek()) {
-            match item1.cmp(item2) {
-                Ordering::Greater => {
-                    let item1 = dedup_pop(&mut items1).unwrap();
-                    let entry1 = self.entry_by_pos(item1.pos);
-                    for parent_entry in entry1.parents() {
-                        assert!(parent_entry.position() < entry1.position());
-                        items1.push(IndexPositionByGeneration::from(&parent_entry));
-                    }
-                }
-                Ordering::Less => {
-                    let item2 = dedup_pop(&mut items2).unwrap();
-                    let entry2 = self.entry_by_pos(item2.pos);
-                    for parent_entry in entry2.parents() {
-                        assert!(parent_entry.position() < entry2.position());
-                        items2.push(IndexPositionByGeneration::from(&parent_entry));
-                    }
-                }
+        while let (Some(&pos1), Some(&pos2)) = (items1.peek(), items2.peek()) {
+            match pos1.cmp(&pos2) {
+                Ordering::Greater => shift_to_parents(self, &mut items1, pos1),
+                Ordering::Less => shift_to_parents(self, &mut items2, pos2),
                 Ordering::Equal => {
-                    result.insert(item1.pos);
+                    result.insert(pos1);
                     dedup_pop(&mut items1).unwrap();
                     dedup_pop(&mut items2).unwrap();
                 }
@@ -399,14 +399,22 @@ impl CompositeIndex {
         // Walk ancestors of the parents of the candidates. Remove visited commits from
         // set of candidates. Stop walking when we have gone past the minimum
         // candidate generation.
-        while let Some(item) = dedup_pop(&mut work) {
-            if item.generation < min_generation {
+        while let Some(&item) = work.peek() {
+            if item.generation_number() < min_generation {
                 break;
             }
-            candidate_positions.remove(&item.pos);
-            let entry = self.entry_by_pos(item.pos);
-            for parent_entry in entry.parents() {
-                assert!(parent_entry.position() < entry.position());
+            let cur_pos = item.position();
+            candidate_positions.remove(&cur_pos);
+            let mut parent_entries = self.entry_by_pos(cur_pos).parents();
+            if let Some(parent_entry) = parent_entries.next() {
+                assert!(parent_entry.position() < cur_pos);
+                dedup_replace(&mut work, IndexPositionByGeneration::from(&parent_entry)).unwrap();
+            } else {
+                dedup_pop(&mut work).unwrap();
+                continue;
+            }
+            for parent_entry in parent_entries {
+                assert!(parent_entry.position() < cur_pos);
                 work.push(IndexPositionByGeneration::from(&parent_entry));
             }
         }
@@ -592,8 +600,26 @@ pub struct IndexStats {
 /// one.
 fn dedup_pop<T: Ord>(heap: &mut BinaryHeap<T>) -> Option<T> {
     let item = heap.pop()?;
-    while heap.peek() == Some(&item) {
-        heap.pop().unwrap();
-    }
+    remove_dup(heap, &item);
     Some(item)
+}
+
+/// Removes the greatest items (including duplicates) from the heap, inserts
+/// lesser `new_item` to the heap, returns the removed one.
+///
+/// This is faster than calling `dedup_pop(heap)` and `heap.push(new_item)`
+/// especially when `new_item` is the next greatest item.
+fn dedup_replace<T: Ord>(heap: &mut BinaryHeap<T>, new_item: T) -> Option<T> {
+    let old_item = {
+        let mut x = heap.peek_mut()?;
+        mem::replace(&mut *x, new_item)
+    };
+    remove_dup(heap, &old_item);
+    Some(old_item)
+}
+
+fn remove_dup<T: Ord>(heap: &mut BinaryHeap<T>, item: &T) {
+    while let Some(x) = heap.peek_mut().filter(|x| **x == *item) {
+        binary_heap::PeekMut::pop(x);
+    }
 }

@@ -17,12 +17,13 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::io::Read;
+use std::pin::Pin;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use thiserror::Error;
+use tokio::io::AsyncRead;
 
 use crate::content_hash::ContentHash;
 use crate::hex_util;
@@ -142,6 +143,8 @@ impl MergedTreeId {
 #[derive(ContentHash, Debug, PartialEq, Eq, Clone)]
 pub struct Commit {
     pub parents: Vec<CommitId>,
+    // TODO: delete commit.predecessors when we can assume that most commits are
+    // tracked by op.commit_predecessors. (in jj 0.42 or so?)
     pub predecessors: Vec<CommitId>,
     pub root_tree: MergedTreeId,
     pub change_id: ChangeId,
@@ -421,12 +424,16 @@ pub trait Backend: Send + Sync + Debug {
     /// sent.
     fn concurrency(&self) -> usize;
 
-    async fn read_file(&self, path: &RepoPath, id: &FileId) -> BackendResult<Box<dyn Read>>;
+    async fn read_file(
+        &self,
+        path: &RepoPath,
+        id: &FileId,
+    ) -> BackendResult<Pin<Box<dyn AsyncRead>>>;
 
     async fn write_file(
         &self,
         path: &RepoPath,
-        contents: &mut (dyn Read + Send),
+        contents: &mut (dyn AsyncRead + Send + Unpin),
     ) -> BackendResult<FileId>;
 
     async fn read_symlink(&self, path: &RepoPath, id: &SymlinkId) -> BackendResult<String>;

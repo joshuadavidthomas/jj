@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use assert_matches::assert_matches;
 use futures::StreamExt as _;
 use indoc::indoc;
 use itertools::Itertools as _;
@@ -113,11 +114,11 @@ fn test_initial(backend: TestRepoBackend) {
     assert_eq!(builder.author(), &author_signature);
     assert_eq!(builder.committer(), &committer_signature);
     let commit = builder.write().unwrap();
-    tx.commit("test").unwrap();
+    let repo = tx.commit("test").unwrap();
 
     let parents: Vec<_> = commit.parents().try_collect().unwrap();
     assert_eq!(parents, vec![store.root_commit()]);
-    assert!(commit.predecessors().next().is_none());
+    assert!(commit.store_commit().predecessors.is_empty());
     assert_eq!(commit.description(), "description");
     assert_eq!(commit.author(), &author_signature);
     assert_eq!(commit.committer(), &committer_signature);
@@ -127,6 +128,10 @@ fn test_initial(backend: TestRepoBackend) {
             &commit.tree().unwrap(),
         ),
         to_owned_path_vec(&[dir_file_path, root_file_path]),
+    );
+    assert_matches!(
+        repo.operation().predecessors_for_commit(commit.id()),
+        Some([])
     );
 }
 
@@ -188,11 +193,13 @@ fn test_rewrite(backend: TestRepoBackend) {
         .write()
         .unwrap();
     tx.repo_mut().rebase_descendants().unwrap();
-    tx.commit("test").unwrap();
+    let repo = tx.commit("test").unwrap();
     let parents: Vec<_> = rewritten_commit.parents().try_collect().unwrap();
     assert_eq!(parents, vec![store.root_commit()]);
-    let predecessors: Vec<_> = rewritten_commit.predecessors().try_collect().unwrap();
-    assert_eq!(predecessors, vec![initial_commit.clone()]);
+    assert_eq!(
+        rewritten_commit.store_commit().predecessors,
+        [initial_commit.id().clone()]
+    );
     assert_eq!(rewritten_commit.author().name, settings.user_name());
     assert_eq!(rewritten_commit.author().email, settings.user_email());
     assert_eq!(
@@ -216,6 +223,15 @@ fn test_rewrite(backend: TestRepoBackend) {
             &rewritten_commit.tree().unwrap(),
         ),
         to_owned_path_vec(&[dir_file_path]),
+    );
+    assert_matches!(
+        repo.operation().predecessors_for_commit(rewritten_commit.id()),
+        Some([id]) if id == initial_commit.id()
+    );
+    assert_matches!(
+        repo.operation()
+            .predecessors_for_commit(initial_commit.id()),
+        None
     );
 }
 
