@@ -166,8 +166,8 @@ fn test_debug_tree() {
     // Defaults to showing the tree at the current commit
     let output = work_dir.run_jj(["debug", "tree"]);
     assert_snapshot!(output.normalize_backslash(), @r#"
-    dir/subdir/file1: Ok(Resolved(Some(File { id: FileId("498e9b01d79cb8d31cdf0df1a663cc1fcefd9de3"), executable: false })))
-    dir/subdir/file2: Ok(Resolved(Some(File { id: FileId("b2496eaffe394cd50a9db4de5787f45f09fd9722"), executable: false })))
+    dir/subdir/file1: Ok(Resolved(Some(File { id: FileId("498e9b01d79cb8d31cdf0df1a663cc1fcefd9de3"), executable: false, copy_id: CopyId("") })))
+    dir/subdir/file2: Ok(Resolved(Some(File { id: FileId("b2496eaffe394cd50a9db4de5787f45f09fd9722"), executable: false, copy_id: CopyId("") })))
     [EOF]
     "#
     );
@@ -175,7 +175,7 @@ fn test_debug_tree() {
     // Can show the tree at another commit
     let output = work_dir.run_jj(["debug", "tree", "-r@-"]);
     assert_snapshot!(output.normalize_backslash(), @r#"
-    dir/subdir/file1: Ok(Resolved(Some(File { id: FileId("498e9b01d79cb8d31cdf0df1a663cc1fcefd9de3"), executable: false })))
+    dir/subdir/file1: Ok(Resolved(Some(File { id: FileId("498e9b01d79cb8d31cdf0df1a663cc1fcefd9de3"), executable: false, copy_id: CopyId("") })))
     [EOF]
     "#
     );
@@ -183,7 +183,7 @@ fn test_debug_tree() {
     // Can filter by paths
     let output = work_dir.run_jj(["debug", "tree", "dir/subdir/file2"]);
     assert_snapshot!(output.normalize_backslash(), @r#"
-    dir/subdir/file2: Ok(Resolved(Some(File { id: FileId("b2496eaffe394cd50a9db4de5787f45f09fd9722"), executable: false })))
+    dir/subdir/file2: Ok(Resolved(Some(File { id: FileId("b2496eaffe394cd50a9db4de5787f45f09fd9722"), executable: false, copy_id: CopyId("") })))
     [EOF]
     "#
     );
@@ -195,8 +195,8 @@ fn test_debug_tree() {
         "--id=0958358e3f80e794f032b25ed2be96cf5825da6c",
     ]);
     assert_snapshot!(output.normalize_backslash(), @r#"
-    dir/subdir/file1: Ok(Resolved(Some(File { id: FileId("498e9b01d79cb8d31cdf0df1a663cc1fcefd9de3"), executable: false })))
-    dir/subdir/file2: Ok(Resolved(Some(File { id: FileId("b2496eaffe394cd50a9db4de5787f45f09fd9722"), executable: false })))
+    dir/subdir/file1: Ok(Resolved(Some(File { id: FileId("498e9b01d79cb8d31cdf0df1a663cc1fcefd9de3"), executable: false, copy_id: CopyId("") })))
+    dir/subdir/file2: Ok(Resolved(Some(File { id: FileId("b2496eaffe394cd50a9db4de5787f45f09fd9722"), executable: false, copy_id: CopyId("") })))
     [EOF]
     "#
     );
@@ -209,8 +209,8 @@ fn test_debug_tree() {
         "--id=6ac232efa713535ae518a1a898b77e76c0478184",
     ]);
     assert_snapshot!(output.normalize_backslash(), @r#"
-    dir/subdir/file1: Ok(Resolved(Some(File { id: FileId("498e9b01d79cb8d31cdf0df1a663cc1fcefd9de3"), executable: false })))
-    dir/subdir/file2: Ok(Resolved(Some(File { id: FileId("b2496eaffe394cd50a9db4de5787f45f09fd9722"), executable: false })))
+    dir/subdir/file1: Ok(Resolved(Some(File { id: FileId("498e9b01d79cb8d31cdf0df1a663cc1fcefd9de3"), executable: false, copy_id: CopyId("") })))
+    dir/subdir/file2: Ok(Resolved(Some(File { id: FileId("b2496eaffe394cd50a9db4de5787f45f09fd9722"), executable: false, copy_id: CopyId("") })))
     [EOF]
     "#
     );
@@ -224,7 +224,7 @@ fn test_debug_tree() {
         "dir/subdir/file2",
     ]);
     assert_snapshot!(output.normalize_backslash(), @r#"
-    dir/subdir/file2: Ok(Resolved(Some(File { id: FileId("b2496eaffe394cd50a9db4de5787f45f09fd9722"), executable: false })))
+    dir/subdir/file2: Ok(Resolved(Some(File { id: FileId("b2496eaffe394cd50a9db4de5787f45f09fd9722"), executable: false, copy_id: CopyId("") })))
     [EOF]
     "#
     );
@@ -237,7 +237,7 @@ fn test_debug_operation_id() {
     let work_dir = test_env.work_dir("repo");
     let output = work_dir.run_jj(["debug", "operation", "--display", "id"]);
     assert_snapshot!(filter_index_stats(output), @r"
-    2affa702525487ca490c4bc8a9a365adf75f972efb5888dd58716de7603e822ba1ed1ed0a50132ee44572bb9d819f37589d0ceb790b397ddcc88c976fde2bf02
+    8f47435a3990362feaf967ca6de2eb0a31c8b883dfcb66fba5c22200d12bbe61e3dc8bc855f1f6879285fcafaf85ac792f9a43bcc36e57d28737d18347d5e752
     [EOF]
     ");
 }

@@ -26,7 +26,6 @@ use std::io::Write as _;
 use std::mem;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::ExitCode;
 use std::rc::Rc;
 use std::str;
 use std::str::FromStr;
@@ -49,6 +48,7 @@ use clap_complete::ArgValueCandidates;
 use clap_complete::ArgValueCompleter;
 use indexmap::IndexMap;
 use indexmap::IndexSet;
+use indoc::indoc;
 use indoc::writedoc;
 use itertools::Itertools as _;
 use jj_lib::backend::BackendResult;
@@ -1768,18 +1768,20 @@ to the current parents may contain changes from multiple commits.
     pub fn commit_summary_template(&self) -> TemplateRenderer<'_, Commit> {
         let language = self.commit_template_language();
         self.reparse_valid_template(&language, &self.commit_summary_template_text)
+            .labeled(["commit"])
     }
 
     /// Template for one-line summary of an operation.
     pub fn operation_summary_template(&self) -> TemplateRenderer<'_, Operation> {
         let language = self.operation_template_language();
         self.reparse_valid_template(&language, &self.op_summary_template_text)
-            .labeled("operation")
+            .labeled(["operation"])
     }
 
     pub fn short_change_id_template(&self) -> TemplateRenderer<'_, Commit> {
         let language = self.commit_template_language();
         self.reparse_valid_template(&language, SHORT_CHANGE_ID_TEMPLATE_TEXT)
+            .labeled(["commit"])
     }
 
     /// Returns one-line summary of the given `commit`.
@@ -2018,7 +2020,7 @@ See https://jj-vcs.github.io/jj/latest/working-copy/#stale-working-copy \
             if let Some(mut formatter) = ui.status_formatter() {
                 let template = self.commit_summary_template();
                 write!(formatter, "Working copy  (@) now at: ")?;
-                formatter.with_label("working_copy", |fmt| template.format(new_commit, fmt))?;
+                template.format(new_commit, formatter.as_mut())?;
                 writeln!(formatter)?;
                 for parent in new_commit.parents() {
                     let parent = parent?;
@@ -2285,7 +2287,8 @@ See https://jj-vcs.github.io/jj/latest/working-copy/#stale-working-copy \
         repo: &ReadonlyRepo,
         conflicted_commits: Vec<CommitId>,
     ) -> Result<(), CommandError> {
-        if !self.settings().get_bool("hints.resolving-conflicts")? {
+        if !self.settings().get_bool("hints.resolving-conflicts")? || conflicted_commits.is_empty()
+        {
             return Ok(());
         }
 
@@ -2299,31 +2302,41 @@ See https://jj-vcs.github.io/jj/latest/working-copy/#stale-working-copy \
             .commits(repo.store())
             .try_collect()?;
 
-        if !root_conflict_commits.is_empty() {
-            let instruction = if only_one_conflicted_commit {
-                "To resolve the conflicts, start by updating to it"
-            } else if root_conflict_commits.len() == 1 {
-                "To resolve the conflicts, start by updating to the first one"
-            } else {
-                "To resolve the conflicts, start by updating to one of the first ones"
-            };
-            writeln!(fmt.labeled("hint").with_heading("Hint: "), "{instruction}:")?;
-            let format_short_change_id = self.short_change_id_template();
-            fmt.with_label("hint", |fmt| {
-                for commit in &root_conflict_commits {
-                    write!(fmt, "  jj new ")?;
-                    format_short_change_id.format(commit, fmt)?;
-                    writeln!(fmt)?;
-                }
-                io::Result::Ok(())
-            })?;
-            writeln!(
-                fmt.labeled("hint"),
-                r#"Then use `jj resolve`, or edit the conflict markers in the file directly.
-Once the conflicts are resolved, you may want to inspect the result with `jj diff`.
-Then run `jj squash` to move the resolution into the conflicted commit."#,
-            )?;
-        }
+        // The common part of these strings is not extracted, to avoid i18n issues.
+        let instruction = if only_one_conflicted_commit {
+            indoc! {"
+            To resolve the conflicts, start by creating a commit on top of
+            the conflicted commit:
+            "}
+        } else if root_conflict_commits.len() == 1 {
+            indoc! {"
+            To resolve the conflicts, start by creating a commit on top of
+            the first conflicted commit:
+            "}
+        } else {
+            indoc! {"
+            To resolve the conflicts, start by creating a commit on top of
+            one of the first conflicted commits:
+            "}
+        };
+        write!(fmt.labeled("hint").with_heading("Hint: "), "{instruction}")?;
+        let format_short_change_id = self.short_change_id_template();
+        fmt.with_label("hint", |fmt| {
+            for commit in &root_conflict_commits {
+                write!(fmt, "  jj new ")?;
+                format_short_change_id.format(commit, fmt)?;
+                writeln!(fmt)?;
+            }
+            io::Result::Ok(())
+        })?;
+        writedoc!(
+            fmt.labeled("hint"),
+            "
+            Then use `jj resolve`, or edit the conflict markers in the file directly.
+            Once the conflicts are resolved, you can inspect the result with `jj diff`.
+            Then run `jj squash` to move the resolution into the conflicted commit.
+            ",
+        )?;
         Ok(())
     }
 
@@ -2439,6 +2452,7 @@ impl WorkspaceCommandTransaction<'_> {
         let language = self.commit_template_language();
         self.helper
             .reparse_valid_template(&language, &self.helper.commit_summary_template_text)
+            .labeled(["commit"])
     }
 
     /// Creates commit template language environment capturing the current
@@ -3924,8 +3938,18 @@ impl<'a> CliRunner<'a> {
         ui.reset(&config)?;
 
         // Print only the last migration messages to omit duplicates.
-        for desc in &last_config_migration_descriptions {
-            writeln!(ui.warning_default(), "Deprecated config: {desc}")?;
+        for (source, desc) in &last_config_migration_descriptions {
+            let source_str = match source {
+                ConfigSource::Default => "default-provided",
+                ConfigSource::EnvBase | ConfigSource::EnvOverrides => "environment-provided",
+                ConfigSource::User => "user-level",
+                ConfigSource::Repo => "repo-level",
+                ConfigSource::CommandArg => "CLI-provided",
+            };
+            writeln!(
+                ui.warning_default(),
+                "Deprecated {source_str} config: {desc}"
+            )?;
         }
 
         if args.global_args.repository.is_some() {
@@ -3967,7 +3991,7 @@ impl<'a> CliRunner<'a> {
 
     #[must_use]
     #[instrument(skip(self))]
-    pub fn run(mut self) -> ExitCode {
+    pub fn run(mut self) -> u8 {
         // Tell crossterm to ignore NO_COLOR (we check it ourselves)
         crossterm::style::force_color_output(true);
         let config = config_from_environment(self.config_layers.drain(..));

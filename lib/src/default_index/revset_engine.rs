@@ -17,7 +17,6 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::cmp::Reverse;
-use std::collections::BTreeSet;
 use std::collections::BinaryHeap;
 use std::collections::HashSet;
 use std::fmt;
@@ -934,9 +933,8 @@ impl EvaluationContext<'_> {
             }
             ResolvedExpression::Heads(candidates) => {
                 let candidate_set = self.evaluate(candidates)?;
-                let head_positions: BTreeSet<_> =
+                let positions =
                     index.heads_pos(candidate_set.positions().attach(index).try_collect()?);
-                let positions = head_positions.into_iter().rev().collect();
                 Ok(Box::new(EagerRevset { positions }))
             }
             ResolvedExpression::Roots(candidates) => {
@@ -966,12 +964,8 @@ impl EvaluationContext<'_> {
                 };
                 let mut positions = vec![position?];
                 for position in expression_positions_iter {
-                    positions = index
-                        .common_ancestors_pos(&positions, [position?].as_slice())
-                        .into_iter()
-                        .collect_vec();
+                    positions = index.common_ancestors_pos(positions, vec![position?]);
                 }
-                positions.reverse();
                 Ok(Box::new(EagerRevset { positions }))
             }
             ResolvedExpression::Latest { candidates, count } => {
@@ -1328,8 +1322,8 @@ fn matches_diff_from_parent(
             let left_future = materialize_tree_value(store, &entry.path, left_value);
             let right_future = materialize_tree_value(store, &entry.path, right_value);
             let (left_value, right_value) = futures::try_join!(left_future, right_future)?;
-            let left_contents = to_file_content(&entry.path, left_value)?;
-            let right_contents = to_file_content(&entry.path, right_value)?;
+            let left_contents = to_file_content(&entry.path, left_value).await?;
+            let right_contents = to_file_content(&entry.path, right_value).await?;
             if diff_match_lines(&left_contents, &right_contents, text_pattern)? {
                 return Ok(true);
             }
@@ -1375,12 +1369,17 @@ fn match_lines<'a, 'b>(
     })
 }
 
-fn to_file_content(path: &RepoPath, value: MaterializedTreeValue) -> BackendResult<Merge<BString>> {
+async fn to_file_content(
+    path: &RepoPath,
+    value: MaterializedTreeValue,
+) -> BackendResult<Merge<BString>> {
     let empty = || Merge::resolved(BString::default());
     match value {
         MaterializedTreeValue::Absent => Ok(empty()),
         MaterializedTreeValue::AccessDenied(_) => Ok(empty()),
-        MaterializedTreeValue::File(mut file) => Ok(Merge::resolved(file.read_all(path)?.into())),
+        MaterializedTreeValue::File(mut file) => {
+            Ok(Merge::resolved(file.read_all(path).await?.into()))
+        }
         MaterializedTreeValue::Symlink { id: _, target } => Ok(Merge::resolved(target.into())),
         MaterializedTreeValue::GitSubmodule(_) => Ok(empty()),
         MaterializedTreeValue::FileConflict(file) => Ok(file.contents),
