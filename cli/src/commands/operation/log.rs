@@ -136,11 +136,10 @@ fn do_op_log(
         };
         template = workspace_env
             .parse_template(ui, &language, &text)?
-            .labeled("operation")
-            .labeled("op_log");
+            .labeled(["op_log", "operation"]);
         op_node_template = workspace_env
             .parse_template(ui, &language, &get_node_template(graph_style, settings)?)?
-            .labeled("node");
+            .labeled(["op_log", "operation", "node"]);
     }
 
     let diff_formats = diff_formats_for_log(settings, &args.diff_format, args.patch)?;
@@ -150,16 +149,18 @@ fn do_op_log(
                          formatter: &mut dyn Formatter,
                          op: &Operation,
                          with_content_format: &LogContentFormat| {
-            let parents: Vec<_> = op.parents().try_collect()?;
-            let parent_op = repo_loader.merge_operations(parents, None)?;
-            let parent_repo = repo_loader.load_at(&parent_op)?;
+            let parent_ops: Vec<_> = op.parents().try_collect()?;
+            let merged_parent_op = repo_loader.merge_operations(parent_ops.clone(), None)?;
+            let parent_repo = repo_loader.load_at(&merged_parent_op)?;
             let repo = repo_loader.load_at(op)?;
 
             let id_prefix_context = workspace_env.new_id_prefix_context();
             let commit_summary_template = {
                 let language =
                     workspace_env.commit_template_language(repo.as_ref(), &id_prefix_context);
-                workspace_env.parse_template(ui, &language, &template_text)?
+                workspace_env
+                    .parse_template(ui, &language, &template_text)?
+                    .labeled(["op_log", "commit"])
             };
             let path_converter = workspace_env.path_converter();
             let conflict_marker_style = workspace_env.conflict_marker_style();
@@ -172,6 +173,11 @@ fn do_op_log(
                 )
             });
 
+            // TODO: Merged repo may have newly rebased commits, which wouldn't
+            // exist in the index. (#4465)
+            if parent_ops.len() > 1 {
+                return Ok(());
+            }
             show_op_diff(
                 ui,
                 formatter,
