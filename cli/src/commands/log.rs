@@ -174,10 +174,10 @@ pub(crate) fn cmd_log(
         };
         template = workspace_command
             .parse_template(ui, &language, &template_string)?
-            .labeled("log");
+            .labeled(["log", "commit"]);
         node_template = workspace_command
             .parse_template(ui, &language, &get_node_template(graph_style, settings)?)?
-            .labeled("node");
+            .labeled(["log", "commit", "node"]);
     }
 
     {
@@ -189,7 +189,7 @@ pub(crate) fn cmd_log(
             let mut raw_output = formatter.raw()?;
             let mut graph = get_graphlog(graph_style, raw_output.as_mut());
             let iter: Box<dyn Iterator<Item = _>> = {
-                let mut forward_iter = TopoGroupedGraphIterator::new(revset.iter_graph());
+                let mut forward_iter = TopoGroupedGraphIterator::new(revset.iter_graph(), |id| id);
 
                 let has_commit = revset.containing_fn();
 

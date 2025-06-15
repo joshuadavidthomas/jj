@@ -17,9 +17,9 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::cmp::Reverse;
-use std::collections::BTreeSet;
 use std::collections::BinaryHeap;
 use std::collections::HashSet;
+use std::convert::Infallible;
 use std::fmt;
 use std::iter;
 use std::ops::Range;
@@ -934,9 +934,41 @@ impl EvaluationContext<'_> {
             }
             ResolvedExpression::Heads(candidates) => {
                 let candidate_set = self.evaluate(candidates)?;
-                let head_positions: BTreeSet<_> =
+                let positions =
                     index.heads_pos(candidate_set.positions().attach(index).try_collect()?);
-                let positions = head_positions.into_iter().rev().collect();
+                Ok(Box::new(EagerRevset { positions }))
+            }
+            ResolvedExpression::HeadsRange {
+                roots,
+                heads,
+                filter,
+            } => {
+                let root_set = self.evaluate(roots)?;
+                let root_positions: Vec<_> = root_set.positions().attach(index).try_collect()?;
+                // Pre-filter heads so queries like 'immutable_heads()..' can
+                // terminate early. immutable_heads() usually includes some
+                // visible heads, which can be trivially rejected.
+                let head_set = self.evaluate(heads)?;
+                let head_positions = difference_by(
+                    head_set.positions(),
+                    EagerRevWalk::new(root_positions.iter().copied().map(Ok)),
+                    |pos1, pos2| pos1.cmp(pos2).reverse(),
+                )
+                .attach(index)
+                .try_collect()?;
+                let positions = if let Some(filter) = filter {
+                    let mut filter = self.evaluate_predicate(filter)?.to_predicate_fn();
+                    index.heads_from_range_and_filter(root_positions, head_positions, |pos| {
+                        filter(index, pos)
+                    })?
+                } else {
+                    let Ok(positions) = index.heads_from_range_and_filter::<Infallible>(
+                        root_positions,
+                        head_positions,
+                        |_| Ok(true),
+                    );
+                    positions
+                };
                 Ok(Box::new(EagerRevset { positions }))
             }
             ResolvedExpression::Roots(candidates) => {
@@ -966,12 +998,8 @@ impl EvaluationContext<'_> {
                 };
                 let mut positions = vec![position?];
                 for position in expression_positions_iter {
-                    positions = index
-                        .common_ancestors_pos(&positions, [position?].as_slice())
-                        .into_iter()
-                        .collect_vec();
+                    positions = index.common_ancestors_pos(positions, vec![position?]);
                 }
-                positions.reverse();
                 Ok(Box::new(EagerRevset { positions }))
             }
             ResolvedExpression::Latest { candidates, count } => {
@@ -1030,6 +1058,11 @@ impl EvaluationContext<'_> {
                 let set1 = self.evaluate_predicate(expression1)?;
                 let set2 = self.evaluate_predicate(expression2)?;
                 Ok(Box::new(UnionRevset { set1, set2 }))
+            }
+            ResolvedPredicateExpression::Intersection(expression1, expression2) => {
+                let set1 = self.evaluate_predicate(expression1)?;
+                let set2 = self.evaluate_predicate(expression2)?;
+                Ok(Box::new(IntersectionRevset { set1, set2 }))
             }
         }
     }
@@ -1228,7 +1261,7 @@ fn build_predicate_fn(
             box_pure_predicate_fn(move |index, pos| {
                 let entry = index.entry_by_pos(pos);
                 let commit = store.get_commit(&entry.commit_id())?;
-                Ok(has_diff_from_parent(&store, index, &commit, &*matcher)?)
+                Ok(has_diff_from_parent(&store, index, &commit, &*matcher).block_on()?)
             })
         }
         RevsetFilterPredicate::DiffContains { text, files } => {
@@ -1237,13 +1270,16 @@ fn build_predicate_fn(
             box_pure_predicate_fn(move |index, pos| {
                 let entry = index.entry_by_pos(pos);
                 let commit = store.get_commit(&entry.commit_id())?;
-                Ok(matches_diff_from_parent(
-                    &store,
-                    index,
-                    &commit,
-                    &text_pattern,
-                    &*files_matcher,
-                )?)
+                Ok(
+                    matches_diff_from_parent(
+                        &store,
+                        index,
+                        &commit,
+                        &text_pattern,
+                        &*files_matcher,
+                    )
+                    .block_on()?,
+                )
             })
         }
         RevsetFilterPredicate::HasConflict => box_pure_predicate_fn(move |index, pos| {
@@ -1267,7 +1303,7 @@ fn build_predicate_fn(
     }
 }
 
-fn has_diff_from_parent(
+async fn has_diff_from_parent(
     store: &Arc<Store>,
     index: &CompositeIndex,
     commit: &Commit,
@@ -1289,22 +1325,19 @@ fn has_diff_from_parent(
     let to_tree = commit.tree()?;
     // TODO: handle copy tracking
     let mut tree_diff = from_tree.diff_stream(&to_tree, matcher);
-    async {
-        // TODO: Resolve values concurrently
-        while let Some(entry) = tree_diff.next().await {
-            let (from_value, to_value) = entry.values?;
-            let from_value = resolve_file_values(store, &entry.path, from_value).await?;
-            if from_value == to_value {
-                continue;
-            }
-            return Ok(true);
+    // TODO: Resolve values concurrently
+    while let Some(entry) = tree_diff.next().await {
+        let (from_value, to_value) = entry.values?;
+        let from_value = resolve_file_values(store, &entry.path, from_value).await?;
+        if from_value == to_value {
+            continue;
         }
-        Ok(false)
+        return Ok(true);
     }
-    .block_on()
+    Ok(false)
 }
 
-fn matches_diff_from_parent(
+async fn matches_diff_from_parent(
     store: &Arc<Store>,
     index: &CompositeIndex,
     commit: &Commit,
@@ -1317,26 +1350,23 @@ fn matches_diff_from_parent(
     let to_tree = commit.tree()?;
     // TODO: handle copy tracking
     let mut tree_diff = from_tree.diff_stream(&to_tree, files_matcher);
-    async {
-        // TODO: Resolve values concurrently
-        while let Some(entry) = tree_diff.next().await {
-            let (left_value, right_value) = entry.values?;
-            let left_value = resolve_file_values(store, &entry.path, left_value).await?;
-            if left_value == right_value {
-                continue;
-            }
-            let left_future = materialize_tree_value(store, &entry.path, left_value);
-            let right_future = materialize_tree_value(store, &entry.path, right_value);
-            let (left_value, right_value) = futures::try_join!(left_future, right_future)?;
-            let left_contents = to_file_content(&entry.path, left_value)?;
-            let right_contents = to_file_content(&entry.path, right_value)?;
-            if diff_match_lines(&left_contents, &right_contents, text_pattern)? {
-                return Ok(true);
-            }
+    // TODO: Resolve values concurrently
+    while let Some(entry) = tree_diff.next().await {
+        let (left_value, right_value) = entry.values?;
+        let left_value = resolve_file_values(store, &entry.path, left_value).await?;
+        if left_value == right_value {
+            continue;
         }
-        Ok(false)
+        let left_future = materialize_tree_value(store, &entry.path, left_value);
+        let right_future = materialize_tree_value(store, &entry.path, right_value);
+        let (left_value, right_value) = futures::try_join!(left_future, right_future)?;
+        let left_contents = to_file_content(&entry.path, left_value).await?;
+        let right_contents = to_file_content(&entry.path, right_value).await?;
+        if diff_match_lines(&left_contents, &right_contents, text_pattern)? {
+            return Ok(true);
+        }
     }
-    .block_on()
+    Ok(false)
 }
 
 fn diff_match_lines(
@@ -1375,12 +1405,17 @@ fn match_lines<'a, 'b>(
     })
 }
 
-fn to_file_content(path: &RepoPath, value: MaterializedTreeValue) -> BackendResult<Merge<BString>> {
+async fn to_file_content(
+    path: &RepoPath,
+    value: MaterializedTreeValue,
+) -> BackendResult<Merge<BString>> {
     let empty = || Merge::resolved(BString::default());
     match value {
         MaterializedTreeValue::Absent => Ok(empty()),
         MaterializedTreeValue::AccessDenied(_) => Ok(empty()),
-        MaterializedTreeValue::File(mut file) => Ok(Merge::resolved(file.read_all(path)?.into())),
+        MaterializedTreeValue::File(mut file) => {
+            Ok(Merge::resolved(file.read_all(path).await?.into()))
+        }
         MaterializedTreeValue::Symlink { id: _, target } => Ok(Merge::resolved(target.into())),
         MaterializedTreeValue::GitSubmodule(_) => Ok(empty()),
         MaterializedTreeValue::FileConflict(file) => Ok(file.contents),

@@ -91,6 +91,8 @@ This document contains the help content for the `jj` command-line program.
 * [`jj status`↴](#jj-status)
 * [`jj tag`↴](#jj-tag)
 * [`jj tag list`↴](#jj-tag-list)
+* [`jj undo`↴](#jj-undo)
+* [`jj unsign`↴](#jj-unsign)
 * [`jj util`↴](#jj-util)
 * [`jj util completion`↴](#jj-util-completion)
 * [`jj util config-schema`↴](#jj-util-config-schema)
@@ -98,8 +100,6 @@ This document contains the help content for the `jj` command-line program.
 * [`jj util gc`↴](#jj-util-gc)
 * [`jj util install-man-pages`↴](#jj-util-install-man-pages)
 * [`jj util markdown-help`↴](#jj-util-markdown-help)
-* [`jj undo`↴](#jj-undo)
-* [`jj unsign`↴](#jj-unsign)
 * [`jj version`↴](#jj-version)
 * [`jj workspace`↴](#jj-workspace)
 * [`jj workspace add`↴](#jj-workspace-add)
@@ -159,9 +159,9 @@ To get started, see the tutorial [`jj help -k tutorial`].
 * `squash` — Move changes from a revision into another revision
 * `status` — Show high-level repo status
 * `tag` — Manage tags
-* `util` — Infrequently used commands such as for generating shell completions
 * `undo` — Undo an operation (shortcut for `jj op undo`)
 * `unsign` — Drop a cryptographic signature
+* `util` — Infrequently used commands such as for generating shell completions
 * `version` — Display version information
 * `workspace` — Commands for working with workspaces
 
@@ -418,7 +418,7 @@ Example: pull up the nearest bookmarks to the working-copy parent
 
 $ jj bookmark move --from 'heads(::@- & bookmarks())' --to @-
 
-**Usage:** `jj bookmark move [OPTIONS] <--from <REVSETS>|NAMES>`
+**Usage:** `jj bookmark move [OPTIONS] <NAMES|--from <REVSETS>>`
 
 **Command Alias:** `m`
 
@@ -770,7 +770,7 @@ If no option is specified, it defaults to `-r @`.
 
 * `-r`, `--revisions <REVSETS>` — Show changes in these revisions
 
-   If there are multiple revisions, then then total diff for all of them will be shown. For example, if you have a linear chain of revisions A..D, then `jj diff -r B::D` equals `jj diff --from A --to D`. Multiple heads and/or roots are supported, but gaps in the revset are not supported (e.g. `jj diff -r 'A|C'` in a linear chain A..C).
+   If there are multiple revisions, then the total diff for all of them will be shown. For example, if you have a linear chain of revisions A..D, then `jj diff -r B::D` equals `jj diff --from A --to D`. Multiple heads and/or roots are supported, but gaps in the revset are not supported (e.g. `jj diff -r 'A|C'` in a linear chain A..C).
 
    If a revision is a merge commit, this shows changes *from* the automatic merge of the contents of all of its parents *to* the contents of the revision itself.
 
@@ -781,6 +781,13 @@ If no option is specified, it defaults to `-r @`.
 * `-t`, `--to <REVSET>` — Show changes to this revision
 
    If none of `-r`, `-f`, or `-t` is provided, then the default is `-r @`.
+* `-T`, `--template <TEMPLATE>` — Render each file diff entry using the given template
+
+   All 0-argument methods of the [`TreeDiffEntry` type] are available as keywords in the template expression. See [`jj help -k templates`] for more information.
+
+   [`TreeDiffEntry` type]: https://jj-vcs.github.io/jj/latest/templates/#treediffentry-type
+
+   [`jj help -k templates`]: https://jj-vcs.github.io/jj/latest/templates/
 * `-s`, `--summary` — For each path, show only whether it was modified, added, or deleted
 * `--stat` — Show a histogram of the changes
 * `--types` — For each path, show only its type before and after
@@ -792,6 +799,8 @@ If no option is specified, it defaults to `-r @`.
 * `--git` — Show a Git-format diff
 * `--color-words` — Show a word-level diff with changes indicated only by color
 * `--tool <TOOL>` — Generate diff by external command
+
+   A builtin format can also be specified as `:<name>`. For example, `--tool=:git` is equivalent to `--git`.
 * `--context <CONTEXT>` — Number of lines of context to show
 * `-w`, `--ignore-all-space` — Ignore whitespace when comparing lines
 * `-b`, `--ignore-space-change` — Ignore changes in amount of whitespace when comparing lines
@@ -884,7 +893,7 @@ Lists the previous commits which a change has pointed to. The current commit of 
 
 ###### **Options:**
 
-* `-r`, `--revision <REVSET>`
+* `-r`, `--revisions <REVSETS>` — Follow changes from these revisions
 
   Default value: `@`
 * `-n`, `--limit <LIMIT>` — Limit number of revisions to show
@@ -915,6 +924,8 @@ Lists the previous commits which a change has pointed to. The current commit of 
 * `--git` — Show a Git-format diff
 * `--color-words` — Show a word-level diff with changes indicated only by color
 * `--tool <TOOL>` — Generate diff by external command
+
+   A builtin format can also be specified as `:<name>`. For example, `--tool=:git` is equivalent to `--git`.
 * `--context <CONTEXT>` — Number of lines of context to show
 * `--ignore-all-space` — Ignore whitespace when comparing lines
 * `--ignore-space-change` — Ignore changes in amount of whitespace when comparing lines
@@ -1465,6 +1476,8 @@ This excludes changes from other commits by temporarily rebasing `--from` onto `
 * `--git` — Show a Git-format diff
 * `--color-words` — Show a word-level diff with changes indicated only by color
 * `--tool <TOOL>` — Generate diff by external command
+
+   A builtin format can also be specified as `:<name>`. For example, `--tool=:git` is equivalent to `--git`.
 * `--context <CONTEXT>` — Number of lines of context to show
 * `-w`, `--ignore-all-space` — Ignore whitespace when comparing lines
 * `-b`, `--ignore-space-change` — Ignore changes in amount of whitespace when comparing lines
@@ -1526,6 +1539,8 @@ The working-copy commit is indicated by a `@` symbol in the graph. [Immutable re
 * `--git` — Show a Git-format diff
 * `--color-words` — Show a word-level diff with changes indicated only by color
 * `--tool <TOOL>` — Generate diff by external command
+
+   A builtin format can also be specified as `:<name>`. For example, `--tool=:git` is equivalent to `--git`.
 * `--context <CONTEXT>` — Number of lines of context to show
 * `--ignore-all-space` — Ignore whitespace when comparing lines
 * `--ignore-space-change` — Ignore changes in amount of whitespace when comparing lines
@@ -1730,6 +1745,8 @@ Compare changes to the repository between two operations
 * `--git` — Show a Git-format diff
 * `--color-words` — Show a word-level diff with changes indicated only by color
 * `--tool <TOOL>` — Generate diff by external command
+
+   A builtin format can also be specified as `:<name>`. For example, `--tool=:git` is equivalent to `--git`.
 * `--context <CONTEXT>` — Number of lines of context to show
 * `--ignore-all-space` — Ignore whitespace when comparing lines
 * `--ignore-space-change` — Ignore changes in amount of whitespace when comparing lines
@@ -1773,6 +1790,8 @@ Like other commands, `jj op log` snapshots the current working-copy changes and 
 * `--git` — Show a Git-format diff
 * `--color-words` — Show a word-level diff with changes indicated only by color
 * `--tool <TOOL>` — Generate diff by external command
+
+   A builtin format can also be specified as `:<name>`. For example, `--tool=:git` is equivalent to `--git`.
 * `--context <CONTEXT>` — Number of lines of context to show
 * `--ignore-all-space` — Ignore whitespace when comparing lines
 * `--ignore-space-change` — Ignore changes in amount of whitespace when comparing lines
@@ -1839,6 +1858,8 @@ Show changes to the repository in an operation
 * `--git` — Show a Git-format diff
 * `--color-words` — Show a word-level diff with changes indicated only by color
 * `--tool <TOOL>` — Generate diff by external command
+
+   A builtin format can also be specified as `:<name>`. For example, `--tool=:git` is equivalent to `--git`.
 * `--context <CONTEXT>` — Number of lines of context to show
 * `--ignore-all-space` — Ignore whitespace when comparing lines
 * `--ignore-space-change` — Ignore changes in amount of whitespace when comparing lines
@@ -2209,6 +2230,9 @@ J           J
 * `-A`, `--insert-after <REVSETS>` [alias: `after`] — The revision(s) to insert after (can be repeated to create a merge commit)
 * `-B`, `--insert-before <REVSETS>` [alias: `before`] — The revision(s) to insert before (can be repeated to create a merge commit)
 * `--skip-emptied` — If true, when rebasing would produce an empty commit, the commit is abandoned. It will not be abandoned if it was already empty before the rebase. Will never skip merge commits with multiple non-empty parents
+* `--keep-divergent` — Keep divergent commits while rebasing
+
+   Without this flag, divergent commits are abandoned while rebasing if another commit with the same change ID is already present in the destination with identical changes.
 
 
 
@@ -2330,10 +2354,12 @@ Show commit description and changes in a revision
 * `--git` — Show a Git-format diff
 * `--color-words` — Show a word-level diff with changes indicated only by color
 * `--tool <TOOL>` — Generate diff by external command
+
+   A builtin format can also be specified as `:<name>`. For example, `--tool=:git` is equivalent to `--git`.
 * `--context <CONTEXT>` — Number of lines of context to show
-* `--ignore-all-space` — Ignore whitespace when comparing lines
-* `--ignore-space-change` — Ignore changes in amount of whitespace when comparing lines
 * `--no-patch` — Do not show the patch
+* `-w`, `--ignore-all-space` — Ignore whitespace when comparing lines
+* `-b`, `--ignore-space-change` — Ignore changes in amount of whitespace when comparing lines
 
 
 
@@ -2442,11 +2468,11 @@ For example, if all you need is the `README.md` and the `lib/` directory, use `j
 
 Split a revision in two
 
-Starts a [diff editor] on the changes in the revision. Edit the right side of the diff until it has the content you want in the first revision. Once you close the editor, your edited content will replace the previous revision. The remaining changes will be put in a new revision on top.
+Starts a [diff editor] on the changes in the revision. Edit the right side of the diff until it has the content you want in the new revision. Once you close the editor, your edited content will replace the previous revision. The remaining changes will be put in a new revision on top.
 
 [diff editor]: https://jj-vcs.github.io/jj/latest/config/#editing-diffs
 
-If the change you split had a description, you will be asked to enter a change description for each commit. If the change did not have a description, the second part will not get a description, and you will be asked for a description only for the first part.
+If the change you split had a description, you will be asked to enter a change description for each commit. If the change did not have a description, the remaining changes will not get a description, and you will be asked for a description only for the selected changes.
 
 Splitting an empty commit is not supported because the same effect can be achieved with `jj new`.
 
@@ -2454,7 +2480,7 @@ Splitting an empty commit is not supported because the same effect can be achiev
 
 ###### **Arguments:**
 
-* `<FILESETS>` — Files matching any of these filesets are put in the first commit
+* `<FILESETS>` — Files matching any of these filesets are put in the selected changes
 
 ###### **Options:**
 
@@ -2568,6 +2594,53 @@ List tags
 
 
 
+## `jj undo`
+
+Undo an operation (shortcut for `jj op undo`)
+
+**Usage:** `jj undo [OPTIONS] [OPERATION]`
+
+###### **Arguments:**
+
+* `<OPERATION>` — The operation to undo
+
+   Use `jj op log` to find an operation to undo.
+
+  Default value: `@`
+
+###### **Options:**
+
+* `--what <WHAT>` — What portions of the local state to restore (can be repeated)
+
+   This option is EXPERIMENTAL.
+
+  Default values: `repo`, `remote-tracking`
+
+  Possible values:
+  - `repo`:
+    The jj repo state and local bookmarks
+  - `remote-tracking`:
+    The remote-tracking bookmarks. Do not restore these if you'd like to push after the undo
+
+
+
+
+## `jj unsign`
+
+Drop a cryptographic signature
+
+See also [commit signing] docs.
+
+[commit signing]: https://jj-vcs.github.io/jj/latest/config/#commit-signing
+
+**Usage:** `jj unsign [OPTIONS]`
+
+###### **Options:**
+
+* `-r`, `--revisions <REVSETS>` — What revision(s) to unsign
+
+
+
 ## `jj util`
 
 Infrequently used commands such as for generating shell completions
@@ -2605,7 +2678,12 @@ Apply it by running one of these:
     source <(jj util completion zsh)
     ```
 
-**Usage:** `jj util completion [SHELL]`
+See the docs on [command-line completion] for more details.
+
+[command-line completion]:
+   https://jj-vcs.github.io/jj/latest/install-and-setup/#command-line-completion
+
+**Usage:** `jj util completion <SHELL>`
 
 ###### **Arguments:**
 
@@ -2658,7 +2736,6 @@ inline it into your config file:
 ```toml
 [aliases]
 my-inline-script = ["util", "exec", "--", "bash", "-c", """
-#!/usr/bin/env bash
 set -euo pipefail
 echo "Look Ma, everything in one file!"
 echo "args: $@"
@@ -2667,6 +2744,9 @@ echo "args: $@"
 # This last empty string will become "$0" in bash, so your actual arguments
 # are all included in "$@" and start at "$1" as expected.
 ```
+
+> Note: Shebangs (e.g. `#!/usr/bin/env`) aren't necessary since you're
+> already explicitly passing your script into the right shell.
 
 **Usage:** `jj util exec <COMMAND> [ARGS]...`
 
@@ -2714,53 +2794,6 @@ Install Jujutsu's manpages to the provided path
 Print the CLI help for all subcommands in Markdown
 
 **Usage:** `jj util markdown-help`
-
-
-
-## `jj undo`
-
-Undo an operation (shortcut for `jj op undo`)
-
-**Usage:** `jj undo [OPTIONS] [OPERATION]`
-
-###### **Arguments:**
-
-* `<OPERATION>` — The operation to undo
-
-   Use `jj op log` to find an operation to undo.
-
-  Default value: `@`
-
-###### **Options:**
-
-* `--what <WHAT>` — What portions of the local state to restore (can be repeated)
-
-   This option is EXPERIMENTAL.
-
-  Default values: `repo`, `remote-tracking`
-
-  Possible values:
-  - `repo`:
-    The jj repo state and local bookmarks
-  - `remote-tracking`:
-    The remote-tracking bookmarks. Do not restore these if you'd like to push after the undo
-
-
-
-
-## `jj unsign`
-
-Drop a cryptographic signature
-
-See also [commit signing] docs.
-
-[commit signing]: https://jj-vcs.github.io/jj/latest/config/#commit-signing
-
-**Usage:** `jj unsign [OPTIONS]`
-
-###### **Options:**
-
-* `-r`, `--revisions <REVSETS>` — What revision(s) to unsign
 
 
 
