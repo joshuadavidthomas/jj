@@ -148,17 +148,27 @@ fn resolve_single_op(
         "@" => get_current_op(),
         s => resolve_single_op_from_store(op_store, s),
     }?;
-    for c in op_postfix.chars() {
+    for (i, c) in op_postfix.chars().enumerate() {
         let mut neighbor_ops = match c {
             '-' => operation.parents().try_collect()?,
             '+' => find_child_ops(head_ops.as_ref().unwrap(), operation.id())?,
             _ => unreachable!(),
         };
         operation = match neighbor_ops.len() {
+            // Since there is no hint provided for `EmptyOperations` in
+            // `opset_resolution_error_hint()` (there would be no useful hint for the
+            // user to take action on anyway), we don't have to worry about op ids being
+            // incoherent with the op set expression shown to the user, unlike for the
+            // `MultipleOperations` variant.
+            //
+            // The full op set expression is guaranteed to be empty in this case,
+            // because ancestors/descendants of an empty operation are empty.
             0 => Err(OpsetResolutionError::EmptyOperations(op_str.to_owned()))?,
             1 => neighbor_ops.pop().unwrap(),
+            // Returns the exact subexpression that resolves to multiple operations,
+            // rather than the full expression provided by the user.
             _ => Err(OpsetResolutionError::MultipleOperations {
-                expr: op_str.to_owned(),
+                expr: op_str[..=op_symbol.len() + i].to_owned(),
                 candidates: neighbor_ops.iter().map(|op| op.id().clone()).collect(),
             })?,
         };
@@ -258,6 +268,7 @@ pub fn walk_ancestors(
         head_ops.into_iter().map(Ok),
         |OperationByEndTime(op)| op.id().clone(),
         |OperationByEndTime(op)| op.parents().map_ok(OperationByEndTime).collect_vec(),
+        |_| panic!("graph has cycle"),
     )
     .map_ok(|OperationByEndTime(op)| op)
 }

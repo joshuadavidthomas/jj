@@ -26,6 +26,7 @@ mod entry;
 mod mutable;
 mod readonly;
 mod rev_walk;
+mod rev_walk_queue;
 pub mod revset_engine;
 mod revset_graph_iterator;
 mod store;
@@ -45,6 +46,8 @@ pub use self::store::DefaultIndexStoreInitError;
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Reverse;
+    use std::convert::Infallible;
     use std::sync::Arc;
 
     use itertools::Itertools as _;
@@ -1096,7 +1099,7 @@ mod tests {
         // to (1,2) and matches the (1,2) of the first input set.
         assert_eq!(
             index.common_ancestors(&[id_1.clone(), id_2.clone()], &[id_5]),
-            vec![id_1.clone(), id_2.clone()]
+            vec![id_2.clone(), id_1.clone()]
         );
         assert_eq!(index.common_ancestors(&[id_1, id_2], &[id_3]), vec![id_0]);
     }
@@ -1197,9 +1200,16 @@ mod tests {
         // Multiple heads
         assert_eq!(
             index
-                .heads(&mut [id_4.clone(), id_3.clone()].iter())
+                .heads(&mut [id_3.clone(), id_4.clone()].iter())
                 .unwrap(),
-            vec![id_3.clone(), id_4]
+            vec![id_4.clone(), id_3.clone()]
+        );
+        // Duplicated inputs
+        assert_eq!(
+            index
+                .heads(&mut [id_4.clone(), id_3.clone(), id_4.clone()].iter())
+                .unwrap(),
+            vec![id_4.clone(), id_3.clone()]
         );
         // Merge commit and ancestors
         assert_eq!(
@@ -1211,12 +1221,109 @@ mod tests {
             index
                 .heads(&mut [id_5.clone(), id_3.clone()].iter())
                 .unwrap(),
-            vec![id_3.clone(), id_5.clone()]
+            vec![id_5.clone(), id_3.clone()]
         );
 
         assert_eq!(
             index.all_heads_for_gc().unwrap().collect_vec(),
             vec![id_3.clone(), id_5.clone()]
+        );
+    }
+
+    #[test]
+    fn test_heads_range_with_filter() {
+        let mut new_change_id = change_id_generator();
+        let mut index = DefaultMutableIndex::full(3, 16);
+        // 5
+        // |\
+        // 4 | 3
+        // | |/
+        // 1 2
+        // |/
+        // 0
+        let id_0 = CommitId::from_hex("000000");
+        let id_1 = CommitId::from_hex("111111");
+        let id_2 = CommitId::from_hex("222222");
+        let id_3 = CommitId::from_hex("333333");
+        let id_4 = CommitId::from_hex("444444");
+        let id_5 = CommitId::from_hex("555555");
+        index.add_commit_data(id_0.clone(), new_change_id(), &[]);
+        index.add_commit_data(id_1.clone(), new_change_id(), &[id_0.clone()]);
+        index.add_commit_data(id_2.clone(), new_change_id(), &[id_0.clone()]);
+        index.add_commit_data(id_3.clone(), new_change_id(), &[id_2.clone()]);
+        index.add_commit_data(id_4.clone(), new_change_id(), &[id_1.clone()]);
+        index.add_commit_data(id_5.clone(), new_change_id(), &[id_4.clone(), id_2.clone()]);
+
+        // Helper function to convert commit IDs to/from index positions and call
+        // `heads_from_range_and_filter`.
+        let heads_range = |roots: &[&CommitId],
+                           heads: &[&CommitId],
+                           filter: &dyn Fn(CommitId) -> bool|
+         -> Vec<CommitId> {
+            let roots = roots
+                .iter()
+                .map(|id| index.as_composite().commit_id_to_pos(id).unwrap())
+                .sorted_by_key(|&pos| Reverse(pos))
+                .collect_vec();
+            let heads = heads
+                .iter()
+                .map(|id| index.as_composite().commit_id_to_pos(id).unwrap())
+                .sorted_by_key(|&pos| Reverse(pos))
+                .collect_vec();
+            index
+                .as_composite()
+                .heads_from_range_and_filter::<Infallible>(roots, heads, |pos| {
+                    Ok(filter(index.as_composite().entry_by_pos(pos).commit_id()))
+                })
+                .unwrap()
+                .into_iter()
+                .map(|pos| index.as_composite().entry_by_pos(pos).commit_id())
+                .collect_vec()
+        };
+
+        // heads(::none())
+        assert!(heads_range(&[], &[], &|_| true).is_empty());
+        // heads(all())
+        assert_eq!(
+            heads_range(&[], &[&id_5, &id_3], &|_| true),
+            vec![id_5.clone(), id_3.clone()]
+        );
+        // heads(~5)
+        assert_eq!(
+            heads_range(&[], &[&id_5, &id_3], &|id| id != id_5),
+            vec![id_4.clone(), id_3.clone()]
+        );
+        // heads(5..)
+        assert_eq!(
+            heads_range(&[&id_5], &[&id_5, &id_3], &|_| true),
+            vec![id_3.clone()]
+        );
+        // heads(5.. ~ 3)
+        assert!(heads_range(&[&id_5], &[&id_5, &id_3], &|id| id != id_3).is_empty());
+        // heads(2..4)
+        assert_eq!(
+            heads_range(&[&id_2], &[&id_4], &|_| true),
+            vec![id_4.clone()]
+        );
+        // heads(2..4 ~ 4)
+        assert_eq!(
+            heads_range(&[&id_2], &[&id_4], &|id| id != id_4),
+            vec![id_1.clone()]
+        );
+        // heads((3 | 1).. ~ 5)
+        assert_eq!(
+            heads_range(&[&id_3, &id_1], &[&id_5, &id_3], &|id| id != id_5),
+            vec![id_4.clone()]
+        );
+        // heads(::(5 | 4) ~ 5)
+        assert_eq!(
+            heads_range(&[], &[&id_5, &id_4], &|id| id != id_5),
+            vec![id_4.clone(), id_2.clone()]
+        );
+        // heads(::(5 | 5))
+        assert_eq!(
+            heads_range(&[], &[&id_5, &id_5], &|_| true),
+            vec![id_5.clone()]
         );
     }
 }

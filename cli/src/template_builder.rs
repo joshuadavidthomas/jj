@@ -42,6 +42,7 @@ use crate::template_parser::TemplateParseError;
 use crate::template_parser::TemplateParseErrorKind;
 use crate::template_parser::TemplateParseResult;
 use crate::template_parser::UnaryOp;
+use crate::templater::BoxedSerializeProperty;
 use crate::templater::BoxedTemplateProperty;
 use crate::templater::CoalesceTemplate;
 use crate::templater::ConcatTemplate;
@@ -171,6 +172,7 @@ where
     fn try_into_integer(self) -> Option<BoxedTemplateProperty<'a, i64>>;
 
     fn try_into_plain_text(self) -> Option<BoxedTemplateProperty<'a, String>>;
+    fn try_into_serialize(self) -> Option<BoxedSerializeProperty<'a>>;
     fn try_into_template(self) -> Option<Box<dyn Template + 'a>>;
 
     /// Transforms into a property that will evaluate to `self == other`.
@@ -296,6 +298,24 @@ impl<'a> CoreTemplatePropertyVar<'a> for CoreTemplatePropertyKind<'a> {
                 let template = self.try_into_template()?;
                 Some(PlainTextFormattedProperty::new(template).into_dyn())
             }
+        }
+    }
+
+    fn try_into_serialize(self) -> Option<BoxedSerializeProperty<'a>> {
+        match self {
+            Self::String(property) => Some(property.into_serialize()),
+            Self::StringList(property) => Some(property.into_serialize()),
+            Self::Boolean(property) => Some(property.into_serialize()),
+            Self::Integer(property) => Some(property.into_serialize()),
+            Self::IntegerOpt(property) => Some(property.into_serialize()),
+            Self::ConfigValue(_) => None,
+            Self::Signature(_) => None,
+            Self::Email(property) => Some(property.into_serialize()),
+            Self::SizeHint(property) => Some(property.into_serialize()),
+            Self::Timestamp(_) => None,
+            Self::TimestampRange(_) => None,
+            Self::Template(_) => None,
+            Self::ListTemplate(_) => None,
         }
     }
 
@@ -664,6 +684,10 @@ impl<'a, P: CoreTemplatePropertyVar<'a>> Expression<P> {
         self.property.try_into_plain_text()
     }
 
+    pub fn try_into_serialize(self) -> Option<BoxedSerializeProperty<'a>> {
+        self.property.try_into_serialize()
+    }
+
     pub fn try_into_template(self) -> Option<Box<dyn Template + 'a>> {
         let template = self.property.try_into_template()?;
         if self.labels.is_empty() {
@@ -812,6 +836,36 @@ fn build_binary_operation<'a, L: TemplateLanguage<'a> + ?Sized>(
                 _ => unreachable!(),
             };
             Ok(L::Property::wrap_property(out))
+        }
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
+            let lhs = expect_integer_expression(language, diagnostics, build_ctx, lhs_node)?;
+            let rhs = expect_integer_expression(language, diagnostics, build_ctx, rhs_node)?;
+            let build = |op: fn(i64, i64) -> Option<i64>, msg: fn(i64) -> &'static str| {
+                (lhs, rhs).and_then(move |(l, r)| {
+                    op(l, r).ok_or_else(|| TemplatePropertyError(msg(r).into()))
+                })
+            };
+            let out = match op {
+                BinaryOp::Add => build(i64::checked_add, |_| "Attempt to add with overflow"),
+                BinaryOp::Sub => build(i64::checked_sub, |_| "Attempt to subtract with overflow"),
+                BinaryOp::Mul => build(i64::checked_mul, |_| "Attempt to multiply with overflow"),
+                BinaryOp::Div => build(i64::checked_div, |r| {
+                    if r == 0 {
+                        "Attempt to divide by zero"
+                    } else {
+                        "Attempt to divide with overflow"
+                    }
+                }),
+                BinaryOp::Rem => build(i64::checked_rem, |r| {
+                    if r == 0 {
+                        "Attempt to divide by zero"
+                    } else {
+                        "Attempt to divide with overflow"
+                    }
+                }),
+                _ => unreachable!(),
+            };
+            Ok(out.into_dyn_wrapped())
         }
     }
 }
@@ -1587,6 +1641,15 @@ fn builtin_functions<'a, L: TemplateLanguage<'a> + ?Sized>() -> TemplateBuildFun
         let content = expect_plain_text_expression(language, diagnostics, build_ctx, content_node)?;
         Ok(L::Property::wrap_property(content))
     });
+    map.insert("json", |language, diagnostics, build_ctx, function| {
+        // TODO: Add pretty=true|false? or json(key=value, ..)? The latter might
+        // be implemented as a map constructor/literal if we add support for
+        // heterogeneous list/map types.
+        let [value_node] = function.expect_exact_arguments()?;
+        let value = expect_serialize_expression(language, diagnostics, build_ctx, value_node)?;
+        let out_property = value.and_then(|v| Ok(serde_json::to_string(&v)?));
+        Ok(out_property.into_dyn_wrapped())
+    });
     map.insert("if", |language, diagnostics, build_ctx, function| {
         let ([condition_node, true_node], [false_node]) = function.expect_arguments()?;
         let condition =
@@ -1932,6 +1995,22 @@ pub fn expect_plain_text_expression<'a, L: TemplateLanguage<'a> + ?Sized>(
     )
 }
 
+pub fn expect_serialize_expression<'a, L: TemplateLanguage<'a> + ?Sized>(
+    language: &L,
+    diagnostics: &mut TemplateDiagnostics,
+    build_ctx: &BuildContext<L::Property>,
+    node: &ExpressionNode,
+) -> TemplateParseResult<BoxedSerializeProperty<'a>> {
+    expect_expression_of_type(
+        language,
+        diagnostics,
+        build_ctx,
+        node,
+        "Serialize",
+        |expression| expression.try_into_serialize(),
+    )
+}
+
 pub fn expect_template_expression<'a, L: TemplateLanguage<'a> + ?Sized>(
     language: &L,
     diagnostics: &mut TemplateDiagnostics,
@@ -2141,7 +2220,7 @@ mod tests {
         1 | description ()
           |             ^---
           |
-          = expected <EOI>, `++`, `||`, `&&`, `==`, `!=`, `>=`, `>`, `<=`, or `<`
+          = expected <EOI>, `++`, `||`, `&&`, `==`, `!=`, `>=`, `>`, `<=`, `<`, `+`, `-`, `*`, `/`, or `%`
         ");
 
         insta::assert_snapshot!(env.parse_err(r#"foo"#), @r"
@@ -2449,20 +2528,49 @@ mod tests {
         env.add_keyword("none_i64", || literal(None));
         env.add_keyword("some_i64", || literal(Some(1)));
         env.add_keyword("i64_min", || literal(i64::MIN));
+        env.add_keyword("i64_max", || literal(i64::MAX));
 
         insta::assert_snapshot!(env.render_ok(r#"-1"#), @"-1");
         insta::assert_snapshot!(env.render_ok(r#"--2"#), @"2");
         insta::assert_snapshot!(env.render_ok(r#"-(3)"#), @"-3");
+        insta::assert_snapshot!(env.render_ok(r#"1 + 2"#), @"3");
+        insta::assert_snapshot!(env.render_ok(r#"2 * 3"#), @"6");
+        insta::assert_snapshot!(env.render_ok(r#"1 + 2 * 3"#), @"7");
+        insta::assert_snapshot!(env.render_ok(r#"4 / 2"#), @"2");
+        insta::assert_snapshot!(env.render_ok(r#"5 / 2"#), @"2");
+        insta::assert_snapshot!(env.render_ok(r#"5 % 2"#), @"1");
 
         // Since methods of the contained value can be invoked, it makes sense
         // to apply operators to optional integers as well.
         insta::assert_snapshot!(env.render_ok(r#"-none_i64"#), @"<Error: No Integer available>");
         insta::assert_snapshot!(env.render_ok(r#"-some_i64"#), @"-1");
+        insta::assert_snapshot!(env.render_ok(r#"some_i64 + some_i64"#), @"2");
+        insta::assert_snapshot!(env.render_ok(r#"some_i64 + none_i64"#), @"<Error: No Integer available>");
+        insta::assert_snapshot!(env.render_ok(r#"none_i64 + some_i64"#), @"<Error: No Integer available>");
+        insta::assert_snapshot!(env.render_ok(r#"none_i64 + none_i64"#), @"<Error: No Integer available>");
 
         // No panic on integer overflow.
         insta::assert_snapshot!(
             env.render_ok(r#"-i64_min"#),
             @"<Error: Attempt to negate with overflow>");
+        insta::assert_snapshot!(
+            env.render_ok(r#"i64_max + 1"#),
+            @"<Error: Attempt to add with overflow>");
+        insta::assert_snapshot!(
+            env.render_ok(r#"i64_min - 1"#),
+            @"<Error: Attempt to subtract with overflow>");
+        insta::assert_snapshot!(
+            env.render_ok(r#"i64_max * 2"#),
+            @"<Error: Attempt to multiply with overflow>");
+        insta::assert_snapshot!(
+            env.render_ok(r#"i64_min / -1"#),
+            @"<Error: Attempt to divide with overflow>");
+        insta::assert_snapshot!(
+            env.render_ok(r#"1 / 0"#),
+            @"<Error: Attempt to divide by zero>");
+        insta::assert_snapshot!(
+            env.render_ok(r#"1 % 0"#),
+            @"<Error: Attempt to divide by zero>");
     }
 
     #[test]
@@ -3196,6 +3304,34 @@ mod tests {
         insta::assert_snapshot!(env.render_ok("stringify(false)"), @"false");
         insta::assert_snapshot!(env.render_ok("stringify(42).len()"), @"2");
         insta::assert_snapshot!(env.render_ok("stringify(label('error', 'text'))"), @"text");
+    }
+
+    #[test]
+    fn test_json_function() {
+        let mut env = TestTemplateEnv::new();
+        env.add_keyword("none_i64", || literal(None::<i64>));
+        env.add_keyword("string_list", || {
+            literal(vec!["foo".to_owned(), "bar".to_owned()])
+        });
+        env.add_keyword("email", || literal(Email("foo@bar".to_owned())));
+        env.add_keyword("size_hint", || literal((5, None)));
+
+        insta::assert_snapshot!(env.render_ok(r#"json('"quoted"')"#), @r#""\"quoted\"""#);
+        insta::assert_snapshot!(env.render_ok(r#"json(string_list)"#), @r#"["foo","bar"]"#);
+        insta::assert_snapshot!(env.render_ok("json(false)"), @"false");
+        insta::assert_snapshot!(env.render_ok("json(42)"), @"42");
+        insta::assert_snapshot!(env.render_ok("json(none_i64)"), @"null");
+        insta::assert_snapshot!(env.render_ok("json(email)"), @r#""foo@bar""#);
+        insta::assert_snapshot!(env.render_ok("json(size_hint)"), @"[5,null]");
+
+        insta::assert_snapshot!(env.parse_err(r#"json(self)"#), @r"
+         --> 1:6
+          |
+        1 | json(self)
+          |      ^--^
+          |
+          = Expected expression of type `Serialize`, but actual type is `Self`
+        ");
     }
 
     #[test]

@@ -10,6 +10,46 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Release highlights
 
+### Breaking changes
+
+* Revset expressions like `hidden_id | description(x)` now [search the specified
+  hidden revision and its ancestors](docs/revsets.md#hidden-revisions) as well
+  as all visible revisions.
+
+### Deprecations
+
+### New features
+
+* `jj diff` now accepts `-T`/`--template` option to customize summary output.
+
+* `jj evolog` can now follow changes from multiple revisions such as divergent
+  revisions.
+
+* Templates now support `json(x)` function to serialize values in JSON format.
+
+* The ANSI 256-color palette can be used when configuring colors. For example,
+  `colors."diff removed token" = { bg = "ansi-color-52", underline = false }`
+  will apply a dark red background on removed words in diffs.
+
+### Fixed bugs
+
+* `jj file annotate` can now process files at a hidden revision.
+
+* `jj op log --op-diff` no longer fails at displaying "reconcile divergent
+  operations." [#4465](https://github.com/jj-vcs/jj/issues/4465)
+
+* `jj util gc --expire=now` now passes the corresponding flag to `git gc`.
+
+* Fixed lockfile issue on stale file handles observed with NFS.
+
+### Packaging changes
+
+* `aarch64-windows` builds (release binaries and `main` snapshots) are now provided.
+
+## [0.30.0] - 2025-06-04
+
+### Release highlights
+
 * The experimental support from release 0.29.0 for transferring the change ID
   to/from Git remotes has been enabled by default. The change ID is stored in
   the Git commit itself (in a commit header called `change-id`), which means
@@ -18,6 +58,16 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `git.write-change-id-header`. Note that some Git remotes (e.g GitLab) and
   some Git commands (e.g. `git rebase`) do not preserve the change ids when
   they rewrite commits.
+
+* `jj rebase` now automatically abandons divergent commits if another commit
+  with the same change ID is already present in the destination with identical
+  changes.
+
+* `jj split` has gained `--message`, `--insert-before`, `--insert-after`, and
+  `--destination` options.
+
+* `jj evolog` can show associated operations for commits created by new jj
+  versions.
 
 ### Breaking changes
 
@@ -29,16 +79,53 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `bookmark.remote() == "foo"` still works, but `bookmark.remote().<method>()`
   might need `if(bookmark.remote(), ..)` to suppress error.
 
+* `jj rebase` now automatically abandons divergent commits if another commit
+  with the same change ID is already present in the destination with identical
+  changes. To keep these divergent commits, use the `--keep-divergent` flag.
+
+* The deprecated `--skip-empty` flag for `jj rebase` has been removed. Use the
+  `--skip-emptied` flag instead.
+
+* The deprecated `jj branch` subcommands have been removed. Use the `jj
+  bookmark` subcommands instead.
+
+* `jj util completion` now requires the name of the shell as a positional
+  argument and no longer produces Bash completions by default. The deprecated
+  optional arguments for different shells have been removed.
+
+* External diff tools are now run in the temporary directory containing
+  the before (`left`) and after (`right`) directories, making diffs appear
+  more pleasing for tools that display file paths prominently. Users can
+  opt out of this by setting `merge-tools.<tool>.diff-do-chdir = false`,
+  but this will likely be removed in a future release. Please report any
+  issues you run into.
+
 ### Deprecations
+
+* The `ui.diff.format` and `ui.diff.tool` config options have been merged as
+  `ui.diff-formatter`. The builtin format can be specified as `:<format>`
+  (e.g. `ui.diff-formatter=":git"` for Git diffs.)
+
+* The `.normal_hex()` method will be removed from the `CommitId` template type.
+  It's useful only for the `ChangeId` type.
 
 ### New features
 
 * `jj split` has gained a `--message` option to set the description of the
   commit with the selected changes.
 
-* `jj split` has gained the ability to place the revision with the selected changes
-  anywhere in the revision tree with the `--insert-before`, `--insert-after` and
-  `--destination` command line flags.
+* `jj split` has gained the ability to place the revision with the selected
+  changes anywhere in the revision tree with the `--insert-before`,
+  `--insert-after` and `--destination` command line flags.
+
+* Added `git.track-default-bookmark-on-clone` setting to control whether to
+  track the default remote bookmark on `jj git clone`.
+
+* Templates can now do arithmetic on integers with the `+`, `-`, `*`, `/`, and
+  `%` infix operators.
+
+* Evolution history is now stored in the operation log. `jj evolog` can show
+  associated operations for commits created by new jj versions.
 
 ### Fixed bugs
 
@@ -46,12 +133,54 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `core.fsmonitor` gitconfig is set in the global or system gitconfigs.
   [#6440](https://github.com/jj-vcs/jj/issues/6440)
 
+* `jj parallelize` can now parallelize groups of changes that _start_ with an
+  immutable change, but do not contain any other immutable changes.
+
+* `jj` will no longer warn about deprecated paths on macOS if the configured
+  XDG directory is the deprecated one (~/Library/Application Support).
+
+* The builtin diff editor now correctly handles splitting changes where a file
+  is replaced by a directory of the same name.
+  [#5189](https://github.com/jj-vcs/jj/issues/5189)
+
 ### Packaging changes
 
-* Due to the removal of the `libgit2` code path, packagers should
-  remove any dependencies on `libgit2`, `libssh2`, Zlib, OpenSSL, and
-  `pkg-config`, and ensure they are not setting the Cargo `git2` or
-  `vendored-openssl` features.
+* Due to the removal of the `libgit2` code path, packagers should remove any
+  dependencies on `libgit2`, `libssh2`, Zlib, OpenSSL, and `pkg-config`, and
+  ensure they are not setting the Cargo `git2` or `vendored-openssl` features.
+
+### Contributors
+
+Thanks to the people who made this release happen!
+
+* Alper Cugun (@alper)
+* Austin Seipp (@thoughtpolice)
+* Benjamin Brittain (@benbrittain)
+* Benjamin Tan (@bnjmnt4n)
+* Bryce Berger (@bryceberger)
+* Colin Nelson (@orthros)
+* Doug Stephen (@dljsjr)
+* Emily (@emilazy)
+* Eyvind Bernhardsen (@eyvind)
+* Felix Geisendörfer (@felixge)
+* Gaëtan Lehmann (@glehmann)
+* Ilya Grigoriev (@ilyagr)
+* Isaac Corbrey (@icorbrey)
+* Jonas Greitemann (@jgreitemann)
+* Josep Mengual (@truita)
+* kkoang (@kkoang)
+* Manuel Mendez (@mmlb)
+* Marshall Bowers (@maxdeviant)
+* Martin von Zweigbergk (@martinvonz)
+* Mateus Auler (@mateusauler)
+* Michael Pratt (@prattmic)
+* Nicole Patricia Mazzuca (@strega-nil)
+* Philip Metzger (@PhilipMetzger)
+* Scott Taylor (@scott2000)
+* T6 (@tjjfvi)
+* Vincent Ging Ho Yim (@cenviity)
+* Winter (@winterqt)
+* Yuya Nishihara (@yuja)
 
 ## [0.29.0] - 2025-05-07
 
@@ -124,13 +253,6 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   in more complex expressions. For example, typing
   `jj log -r first-bookmark..sec` and then pressing Tab could complete the
   expression to `first-bookmark..second-bookmark`.
-
-* External diff tools are now run in the temporary directory containing
-  the before (`left`) and after (`right`) directories, making diffs appear
-  more pleasing for tools that display file paths prominently. Users can
-  opt out of this by setting `merge-tools.<tool>.diff-do-chdir = false`,
-  but this will likely be removed in a future release. Please report any
-  issues you run into.
 
 ### Fixed bugs
 
@@ -656,7 +778,7 @@ Thanks to the people who made this release happen!
 * Added `--into` flag to `jj restore`, similarly to `jj squash` and `jj
   absorb`. It is equivalent to `--to`, but `--into` is the recommended name.
 
-* Italic text is now supported. You can set e.g. `color.error = { fg = "red",
+* Italic text is now supported. You can set e.g. `colors.error = { fg = "red",
   italic = true }` in your config.
 
 * New `author_name`/`author_email`/`committer_name`/`committer_email(pattern)`
@@ -2897,7 +3019,7 @@ Thanks to the people who made this release happen!
 * Per-repository configuration is now read from `.jj/repo/config.toml`.
 
 * Background colors, bold text, and underlining are now supported. You can set
-  e.g. `color.error = { bg = "red", bold = true, underline = true }` in your
+  e.g. `colors.error = { bg = "red", bold = true, underline = true }` in your
   `~/.jjconfig.toml`.
 
 * The `empty` condition in templates is true when the commit makes no change to

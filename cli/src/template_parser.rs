@@ -80,6 +80,11 @@ impl Rule {
             Rule::gt_op => Some(">"),
             Rule::le_op => Some("<="),
             Rule::lt_op => Some("<"),
+            Rule::add_op => Some("+"),
+            Rule::sub_op => Some("-"),
+            Rule::mul_op => Some("*"),
+            Rule::div_op => Some("/"),
+            Rule::rem_op => Some("%"),
             Rule::logical_not_op => Some("!"),
             Rule::negate_op => Some("-"),
             Rule::prefix_ops => None,
@@ -377,6 +382,16 @@ pub enum BinaryOp {
     Le,
     /// `<`
     Lt,
+    /// `+`
+    Add,
+    /// `-`
+    Sub,
+    /// `*`
+    Mul,
+    /// `/`
+    Div,
+    /// `%`
+    Rem,
 }
 
 pub type ExpressionNode<'i> = dsl_util::ExpressionNode<'i, ExpressionKind<'i>>;
@@ -404,7 +419,7 @@ fn parse_identifier_or_literal(pair: Pair<Rule>) -> ExpressionKind {
     }
 }
 
-fn parse_identifier_name(pair: Pair<Rule>) -> TemplateParseResult<&str> {
+fn parse_identifier_name(pair: Pair<'_, Rule>) -> TemplateParseResult<&str> {
     let span = pair.as_span();
     if let ExpressionKind::Identifier(name) = parse_identifier_or_literal(pair) {
         Ok(name)
@@ -413,7 +428,7 @@ fn parse_identifier_name(pair: Pair<Rule>) -> TemplateParseResult<&str> {
     }
 }
 
-fn parse_formal_parameters(params_pair: Pair<Rule>) -> TemplateParseResult<Vec<&str>> {
+fn parse_formal_parameters(params_pair: Pair<'_, Rule>) -> TemplateParseResult<Vec<&str>> {
     assert_eq!(params_pair.as_rule(), Rule::formal_parameters);
     let params_span = params_pair.as_span();
     let params: Vec<_> = params_pair
@@ -512,6 +527,10 @@ fn parse_expression_node(pair: Pair<Rule>) -> TemplateParseResult<ExpressionNode
                 | Op::infix(Rule::gt_op, Assoc::Left)
                 | Op::infix(Rule::le_op, Assoc::Left)
                 | Op::infix(Rule::lt_op, Assoc::Left))
+            .op(Op::infix(Rule::add_op, Assoc::Left) | Op::infix(Rule::sub_op, Assoc::Left))
+            .op(Op::infix(Rule::mul_op, Assoc::Left)
+                | Op::infix(Rule::div_op, Assoc::Left)
+                | Op::infix(Rule::rem_op, Assoc::Left))
             .op(Op::prefix(Rule::logical_not_op) | Op::prefix(Rule::negate_op))
     });
     PRATT
@@ -537,6 +556,11 @@ fn parse_expression_node(pair: Pair<Rule>) -> TemplateParseResult<ExpressionNode
                 Rule::gt_op => BinaryOp::Gt,
                 Rule::le_op => BinaryOp::Le,
                 Rule::lt_op => BinaryOp::Lt,
+                Rule::add_op => BinaryOp::Add,
+                Rule::sub_op => BinaryOp::Sub,
+                Rule::mul_op => BinaryOp::Mul,
+                Rule::div_op => BinaryOp::Div,
+                Rule::rem_op => BinaryOp::Rem,
                 r => panic!("unexpected infix operator rule {r:?}"),
             };
             let lhs = Box::new(lhs?);
@@ -567,7 +591,7 @@ fn parse_template_node(pair: Pair<Rule>) -> TemplateParseResult<ExpressionNode> 
 }
 
 /// Parses text into AST nodes. No type/name checking is made at this stage.
-pub fn parse_template(template_text: &str) -> TemplateParseResult<ExpressionNode> {
+pub fn parse_template(template_text: &str) -> TemplateParseResult<ExpressionNode<'_>> {
     let mut pairs: Pairs<Rule> = TemplateParser::parse(Rule::program, template_text)?;
     let first_pair = pairs.next().unwrap();
     if first_pair.as_rule() == Rule::EOI {
@@ -749,13 +773,13 @@ mod tests {
         WithTemplateAliasesMap(aliases_map)
     }
 
-    fn parse_into_kind(template_text: &str) -> Result<ExpressionKind, TemplateParseErrorKind> {
+    fn parse_into_kind(template_text: &str) -> Result<ExpressionKind<'_>, TemplateParseErrorKind> {
         parse_template(template_text)
             .map(|node| node.kind)
             .map_err(|err| err.kind)
     }
 
-    fn parse_normalized(template_text: &str) -> ExpressionNode {
+    fn parse_normalized(template_text: &str) -> ExpressionNode<'_> {
         normalize_tree(parse_template(template_text).unwrap())
     }
 
@@ -885,6 +909,10 @@ mod tests {
         assert_eq!(
             parse_normalized("x == y || y != z && !z"),
             parse_normalized("(x == y) || ((y != z) && (!z))"),
+        );
+        assert_eq!(
+            parse_normalized("a + b * c / d % e - -f == g"),
+            parse_normalized("((a + (((b * c) / d) % e)) - (-f)) == g"),
         );
 
         // Logical operator bounds more tightly than concatenation. This might

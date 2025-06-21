@@ -128,6 +128,16 @@ You can also use a 6-digit hex code for more control over the exact color used:
 change_id = "#ff1525"
 ```
 
+`jj` also supports colors from the [ANSI 256-color palette] as `ansi-color-<N>`,
+where `<N>` is a number between 0 and 255:
+
+```toml
+[colors]
+commit_id = "ansi-color-81"
+```
+
+[ANSI 256-color palette]: https://en.wikipedia.org/wiki/ANSI_escape_code#8-bit
+
 If you use a string value for a color, as in the examples above, it will be used
 for the foreground color. You can also set the background color, reverse colors
 (swap foreground and background), or make the text bold, italic, or underlined.
@@ -284,8 +294,10 @@ can override the default style with the following keys:
 
 ```toml
 [ui]
-# Possible values: "color-words" (default), "git", "summary"
-diff.format = "git"
+# Builtin formats: ":color-words" (default), ":git",
+#                  ":summary", ":stat", ":types", ":name-only"
+# or external command name and arguments (see below)
+diff-formatter = ":git"
 ```
 
 #### Color-words diff options
@@ -337,15 +349,15 @@ context = 3
 
 ### Generating diffs by external command
 
-If `ui.diff.tool` is set, the specified diff command will be called instead of
-the internal diff function.
+If `ui.diff-formatter` is not a builtin format, the specified diff command will
+be called.
 
 ```toml
 [ui]
 # Use Difftastic by default
-diff.tool = ["difft", "--color=always", "$left", "$right"]
+diff-formatter = ["difft", "--color=always", "$left", "$right"]
 # Use tool named "<name>" (see below)
-diff.tool = "<name>"
+diff-formatter = "<name>"
 ```
 
 The external diff tool can also be enabled by `diff --tool <name>` argument.
@@ -366,7 +378,7 @@ invocations as follows:
 
 ```toml
 [ui]
-diff.tool = "vimdiff"
+diff-formatter = "vimdiff"
 
 [merge-tools.vimdiff]
 diff-invocation-mode = "file-by-file"
@@ -844,7 +856,6 @@ my-script = ["util", "exec", "--", "my-jj-script"]
 #                            ^^^^
 # This makes sure that flags are passed to your script instead of parsed by jj.
 my-inline-script = ["util", "exec", "--", "bash", "-c", """
-#!/usr/bin/env bash
 set -euo pipefail
 echo "Look Ma, everything in one file!"
 echo "args: $@"
@@ -853,6 +864,9 @@ echo "args: $@"
 # This last empty string will become "$0" in bash, so your actual arguments
 # are all included in "$@" and start at "$1" as expected.
 ```
+
+> Note: Shebangs (e.g. `#!/usr/bin/env`) aren't necessary since you're already
+> explicitly passing your script into the right shell.
 
 ## Editor
 
@@ -1458,6 +1472,20 @@ jj bookmark delete gh-pages
 jj bookmark untrack gh-pages@upstream
 ```
 
+### Automatic local bookmark creation on `jj git clone`
+
+When cloning a new Git repository, `jj` by default creates a local bookmark
+tracking the default remote bookmark (such as `main` for `main@origin`.) If you
+aren't going to update the `main` bookmark locally, the tracking bookmark isn't
+necessary.
+
+This behavior can be disabled by
+
+```toml
+[git]
+track-default-bookmark-on-clone = false
+```
+
 ### Abandon commits that became unreachable in Git
 
 By default, when `jj` imports refs from Git, it will look for commits that used
@@ -1535,6 +1563,11 @@ snapshots on filesystem changes by setting
 
 You can check whether Watchman is enabled and whether it is installed correctly
 using `jj debug watchman status`.
+
+Note: `watchman` heavily uses `inotify` and sets up a user watch per-file. On
+large repositories, this may cause `watchman` to fail and commands like
+`jj status` to take longer than expected. If you experience this run
+`jj debug watchman status` and tune your `inotify` limits.
 
 ## Snapshot settings
 
@@ -1643,20 +1676,20 @@ This enables features like:
 Here are some popular editors with TOML schema validation support:
 
 - VS Code
-  - Install [Even Better TOML](https://marketplace.visualstudio.com/items?itemName=tamasfe.even-better-toml)
+    - Install [Even Better TOML](https://marketplace.visualstudio.com/items?itemName=tamasfe.even-better-toml)
 
 - Neovim/Vim
-  - Use with [nvim-lspconfig](https://github.com/neovim/nvim-lspconfig) and [taplo](https://github.com/tamasfe/taplo)
+    - Use with [nvim-lspconfig](https://github.com/neovim/nvim-lspconfig) and [taplo](https://github.com/tamasfe/taplo)
 
 - Helix
-  - Install [taplo](https://github.com/tamasfe/taplo)
+    - Install [taplo](https://github.com/tamasfe/taplo)
 
 - JetBrains IDEs (IntelliJ, PyCharm, etc)
-  - Install [TOML](https://plugins.jetbrains.com/plugin/8195-toml) plugin
+    - Install [TOML](https://plugins.jetbrains.com/plugin/8195-toml) plugin
 
 - Emacs
-  - Install [lsp-mode](https://github.com/emacs-lsp/lsp-mode) and [toml-mode](https://github.com/dryman/toml-mode.el)
-  - Configure [taplo](https://github.com/tamasfe/taplo) as the LSP server
+    - Install [lsp-mode](https://github.com/emacs-lsp/lsp-mode) and [toml-mode](https://github.com/dryman/toml-mode.el)
+    - Configure [taplo](https://github.com/tamasfe/taplo) as the LSP server
 
 ### Specifying config on the command-line
 

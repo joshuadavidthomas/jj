@@ -19,6 +19,7 @@ use std::collections::hash_map;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt;
+use std::ops::ControlFlow;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -231,6 +232,9 @@ pub enum RevsetExpression<St: ExpressionState> {
     None,
     All,
     VisibleHeads,
+    /// Visible heads and all referenced commits within the current expression
+    /// scope. Used as the default of `Range`/`DagRange` heads.
+    VisibleHeadsOrReferenced,
     Root,
     Commits(Vec<CommitId>),
     CommitRef(St::CommitRef),
@@ -260,6 +264,13 @@ pub enum RevsetExpression<St: ExpressionState> {
         domain: Rc<Self>,
     },
     Heads(Rc<Self>),
+    /// Heads of the set of commits which are ancestors of `heads` but are not
+    /// ancestors of `roots`, and which also are contained in `filter`.
+    HeadsRange {
+        roots: Rc<Self>,
+        heads: Rc<Self>,
+        filter: Rc<Self>,
+    },
     Roots(Rc<Self>),
     ForkPoint(Rc<Self>),
     Latest {
@@ -273,6 +284,13 @@ pub enum RevsetExpression<St: ExpressionState> {
     AtOperation {
         operation: St::Operation,
         candidates: Rc<Self>,
+    },
+    /// Makes `All` include the commits and their ancestors in addition to the
+    /// visible heads.
+    WithinReference {
+        candidates: Rc<Self>,
+        /// Commits explicitly referenced within the scope.
+        commits: Vec<CommitId>,
     },
     /// Resolves visibility within the specified repo state.
     WithinVisibility {
@@ -295,12 +313,18 @@ impl<St: ExpressionState> RevsetExpression<St> {
         Rc::new(Self::None)
     }
 
+    /// Ancestors of visible heads and all referenced commits within the current
+    /// expression scope, which may include hidden commits.
     pub fn all() -> Rc<Self> {
         Rc::new(Self::All)
     }
 
     pub fn visible_heads() -> Rc<Self> {
         Rc::new(Self::VisibleHeads)
+    }
+
+    fn visible_heads_or_referenced() -> Rc<Self> {
+        Rc::new(Self::VisibleHeadsOrReferenced)
     }
 
     pub fn root() -> Rc<Self> {
@@ -500,15 +524,7 @@ impl<St: ExpressionState> RevsetExpression<St> {
 
     /// Commits that are in any of the `expressions`.
     pub fn union_all(expressions: &[Rc<Self>]) -> Rc<Self> {
-        match expressions {
-            [] => Self::none(),
-            [expression] => expression.clone(),
-            _ => {
-                // Build balanced tree to minimize the recursion depth.
-                let (left, right) = expressions.split_at(expressions.len() / 2);
-                Self::union(&Self::union_all(left), &Self::union_all(right))
-            }
-        }
+        to_binary_expression(expressions, &Self::none, &Self::union)
     }
 
     /// Commits that are in `self` and in `other`.
@@ -524,15 +540,11 @@ impl<St: ExpressionState> RevsetExpression<St> {
     /// Commits that are in the first expression in `expressions` that is not
     /// `none()`.
     pub fn coalesce(expressions: &[Rc<Self>]) -> Rc<Self> {
-        match expressions {
-            [] => Self::none(),
-            [expression] => expression.clone(),
-            _ => {
-                // Build balanced tree to minimize the recursion depth.
-                let (left, right) = expressions.split_at(expressions.len() / 2);
-                Rc::new(Self::Coalesce(Self::coalesce(left), Self::coalesce(right)))
-            }
-        }
+        to_binary_expression(expressions, &Self::none, &Self::coalesce2)
+    }
+
+    fn coalesce2(self: &Rc<Self>, other: &Rc<Self>) -> Rc<Self> {
+        Rc::new(Self::Coalesce(self.clone(), other.clone()))
     }
 }
 
@@ -564,7 +576,8 @@ impl ResolvedRevsetExpression {
         self: Rc<Self>,
         repo: &'index dyn Repo,
     ) -> Result<Box<dyn Revset + 'index>, RevsetEvaluationError> {
-        optimize(self).evaluate_unoptimized(repo)
+        let expr = optimize(self).to_backend_expression(repo);
+        repo.index().evaluate_revset(&expr, repo.store())
     }
 
     /// Evaluates this expression without optimizing it.
@@ -572,10 +585,15 @@ impl ResolvedRevsetExpression {
     /// Use this function if `self` is already optimized, or to debug
     /// optimization pass.
     pub fn evaluate_unoptimized<'index>(
-        &self,
+        self: &Rc<Self>,
         repo: &'index dyn Repo,
     ) -> Result<Box<dyn Revset + 'index>, RevsetEvaluationError> {
-        let expr = self.to_backend_expression(repo);
+        // Since referenced commits change the evaluation result, they must be
+        // collected no matter if optimization is disabled.
+        let expr = resolve_referenced_commits(self)
+            .as_ref()
+            .unwrap_or(self)
+            .to_backend_expression(repo);
         repo.index().evaluate_revset(&expr, repo.store())
     }
 
@@ -593,11 +611,9 @@ pub enum ResolvedPredicateExpression {
     /// Set expression to be evaluated as filter. This is typically a subtree
     /// node of `Union` with a pure filter predicate.
     Set(Box<ResolvedExpression>),
-    NotIn(Box<ResolvedPredicateExpression>),
-    Union(
-        Box<ResolvedPredicateExpression>,
-        Box<ResolvedPredicateExpression>,
-    ),
+    NotIn(Box<Self>),
+    Union(Box<Self>, Box<Self>),
+    Intersection(Box<Self>, Box<Self>),
 }
 
 /// Describes evaluation plan of revset expression.
@@ -632,6 +648,13 @@ pub enum ResolvedExpression {
         domain: Box<Self>,
     },
     Heads(Box<Self>),
+    /// Heads of the set of commits which are ancestors of `heads` but are not
+    /// ancestors of `roots`, and which also are contained in `filter`.
+    HeadsRange {
+        roots: Box<Self>,
+        heads: Box<Self>,
+        filter: Option<ResolvedPredicateExpression>,
+    },
     Roots(Box<Self>),
     ForkPoint(Box<Self>),
     Latest {
@@ -1075,9 +1098,7 @@ pub fn lower_expression(
             ))
         }
         ExpressionKind::DagRangeAll => Ok(RevsetExpression::all()),
-        ExpressionKind::RangeAll => {
-            Ok(RevsetExpression::root().range(&RevsetExpression::visible_heads()))
-        }
+        ExpressionKind::RangeAll => Ok(RevsetExpression::root().negated()),
         ExpressionKind::Unary(op, arg_node) => {
             let arg = lower_expression(diagnostics, arg_node, context)?;
             match op {
@@ -1085,7 +1106,7 @@ pub fn lower_expression(
                 UnaryOp::DagRangePre => Ok(arg.ancestors()),
                 UnaryOp::DagRangePost => Ok(arg.descendants()),
                 UnaryOp::RangePre => Ok(RevsetExpression::root().range(&arg)),
-                UnaryOp::RangePost => Ok(arg.range(&RevsetExpression::visible_heads())),
+                UnaryOp::RangePost => Ok(arg.ancestors().negated()),
                 UnaryOp::Parents => Ok(arg.parents()),
                 UnaryOp::Children => Ok(arg.children()),
             }
@@ -1164,27 +1185,57 @@ pub fn parse_with_modifier(
     .map_err(|err| err.extend_function_candidates(context.aliases_map.function_names()))
 }
 
+/// Constructs binary tree from `expressions` list, `unit` node, and associative
+/// `binary` operation.
+fn to_binary_expression<T: Clone>(
+    expressions: &[T],
+    unit: &impl Fn() -> T,
+    binary: &impl Fn(&T, &T) -> T,
+) -> T {
+    match expressions {
+        [] => unit(),
+        [expression] => expression.clone(),
+        _ => {
+            // Build balanced tree to minimize the recursion depth.
+            let (left, right) = expressions.split_at(expressions.len() / 2);
+            binary(
+                &to_binary_expression(left, unit, binary),
+                &to_binary_expression(right, unit, binary),
+            )
+        }
+    }
+}
+
 /// `Some` for rewritten expression, or `None` to reuse the original expression.
 type TransformedExpression<St> = Option<Rc<RevsetExpression<St>>>;
+/// `Break` to not transform subtree recursively. `Continue(Some(rewritten))`
+/// isn't allowed because it could be a source of infinite substitution bugs.
+type PreTransformedExpression<St> = ControlFlow<TransformedExpression<St>, ()>;
 
-/// Walks `expression` tree and applies `f` recursively from leaf nodes.
+/// Walks `expression` tree and applies `pre`/`post` transformation recursively.
+fn transform_expression<St: ExpressionState>(
+    expression: &Rc<RevsetExpression<St>>,
+    mut pre: impl FnMut(&Rc<RevsetExpression<St>>) -> PreTransformedExpression<St>,
+    mut post: impl FnMut(&Rc<RevsetExpression<St>>) -> TransformedExpression<St>,
+) -> TransformedExpression<St> {
+    let Ok(transformed) =
+        try_transform_expression::<St, Infallible>(expression, |x| Ok(pre(x)), |x| Ok(post(x)));
+    transformed
+}
+
+/// Walks `expression` tree and applies `post` recursively from leaf nodes.
 fn transform_expression_bottom_up<St: ExpressionState>(
     expression: &Rc<RevsetExpression<St>>,
-    mut f: impl FnMut(&Rc<RevsetExpression<St>>) -> TransformedExpression<St>,
+    post: impl FnMut(&Rc<RevsetExpression<St>>) -> TransformedExpression<St>,
 ) -> TransformedExpression<St> {
-    try_transform_expression::<St, Infallible>(
-        expression,
-        |_| Ok(None),
-        |expression| Ok(f(expression)),
-    )
-    .unwrap()
+    transform_expression(expression, |_| ControlFlow::Continue(()), post)
 }
 
 /// Walks `expression` tree and applies transformation recursively.
 ///
-/// `pre` is the callback to rewrite subtree including children. It is
-/// invoked before visiting the child nodes. If returned `Some`, children
-/// won't be visited.
+/// `pre` is the callback to rewrite subtree including children. It is invoked
+/// before visiting the child nodes. If returned `Break`, children won't be
+/// visited.
 ///
 /// `post` is the callback to rewrite from leaf nodes. If returned `None`,
 /// the original expression node will be reused.
@@ -1194,18 +1245,19 @@ fn transform_expression_bottom_up<St: ExpressionState>(
 /// applied repeatedly until converged.
 fn try_transform_expression<St: ExpressionState, E>(
     expression: &Rc<RevsetExpression<St>>,
-    mut pre: impl FnMut(&Rc<RevsetExpression<St>>) -> Result<TransformedExpression<St>, E>,
+    mut pre: impl FnMut(&Rc<RevsetExpression<St>>) -> Result<PreTransformedExpression<St>, E>,
     mut post: impl FnMut(&Rc<RevsetExpression<St>>) -> Result<TransformedExpression<St>, E>,
 ) -> Result<TransformedExpression<St>, E> {
     fn transform_child_rec<St: ExpressionState, E>(
         expression: &Rc<RevsetExpression<St>>,
-        pre: &mut impl FnMut(&Rc<RevsetExpression<St>>) -> Result<TransformedExpression<St>, E>,
+        pre: &mut impl FnMut(&Rc<RevsetExpression<St>>) -> Result<PreTransformedExpression<St>, E>,
         post: &mut impl FnMut(&Rc<RevsetExpression<St>>) -> Result<TransformedExpression<St>, E>,
     ) -> Result<TransformedExpression<St>, E> {
         Ok(match expression.as_ref() {
             RevsetExpression::None => None,
             RevsetExpression::All => None,
             RevsetExpression::VisibleHeads => None,
+            RevsetExpression::VisibleHeadsOrReferenced => None,
             RevsetExpression::Root => None,
             RevsetExpression::Commits(_) => None,
             RevsetExpression::CommitRef(_) => None,
@@ -1241,6 +1293,23 @@ fn try_transform_expression<St: ExpressionState, E>(
             RevsetExpression::Heads(candidates) => {
                 transform_rec(candidates, pre, post)?.map(RevsetExpression::Heads)
             }
+            RevsetExpression::HeadsRange {
+                roots,
+                heads,
+                filter,
+            } => {
+                let transformed_roots = transform_rec(roots, pre, post)?;
+                let transformed_heads = transform_rec(heads, pre, post)?;
+                let transformed_filter = transform_rec(filter, pre, post)?;
+                (transformed_roots.is_some()
+                    || transformed_heads.is_some()
+                    || transformed_filter.is_some())
+                .then(|| RevsetExpression::HeadsRange {
+                    roots: transformed_roots.unwrap_or_else(|| roots.clone()),
+                    heads: transformed_heads.unwrap_or_else(|| heads.clone()),
+                    filter: transformed_filter.unwrap_or_else(|| filter.clone()),
+                })
+            }
             RevsetExpression::Roots(candidates) => {
                 transform_rec(candidates, pre, post)?.map(RevsetExpression::Roots)
             }
@@ -1263,6 +1332,15 @@ fn try_transform_expression<St: ExpressionState, E>(
                 RevsetExpression::AtOperation {
                     operation: operation.clone(),
                     candidates,
+                }
+            }),
+            RevsetExpression::WithinReference {
+                candidates,
+                commits,
+            } => transform_rec(candidates, pre, post)?.map(|candidates| {
+                RevsetExpression::WithinReference {
+                    candidates,
+                    commits: commits.clone(),
                 }
             }),
             RevsetExpression::WithinVisibility {
@@ -1312,7 +1390,7 @@ fn try_transform_expression<St: ExpressionState, E>(
     #[expect(clippy::type_complexity)]
     fn transform_rec_pair<St: ExpressionState, E>(
         (expression1, expression2): (&Rc<RevsetExpression<St>>, &Rc<RevsetExpression<St>>),
-        pre: &mut impl FnMut(&Rc<RevsetExpression<St>>) -> Result<TransformedExpression<St>, E>,
+        pre: &mut impl FnMut(&Rc<RevsetExpression<St>>) -> Result<PreTransformedExpression<St>, E>,
         post: &mut impl FnMut(&Rc<RevsetExpression<St>>) -> Result<TransformedExpression<St>, E>,
     ) -> Result<Option<(Rc<RevsetExpression<St>>, Rc<RevsetExpression<St>>)>, E> {
         match (
@@ -1330,11 +1408,11 @@ fn try_transform_expression<St: ExpressionState, E>(
 
     fn transform_rec<St: ExpressionState, E>(
         expression: &Rc<RevsetExpression<St>>,
-        pre: &mut impl FnMut(&Rc<RevsetExpression<St>>) -> Result<TransformedExpression<St>, E>,
+        pre: &mut impl FnMut(&Rc<RevsetExpression<St>>) -> Result<PreTransformedExpression<St>, E>,
         post: &mut impl FnMut(&Rc<RevsetExpression<St>>) -> Result<TransformedExpression<St>, E>,
     ) -> Result<TransformedExpression<St>, E> {
-        if let Some(new_expression) = pre(expression)? {
-            return Ok(Some(new_expression));
+        if let ControlFlow::Break(transformed) = pre(expression)? {
+            return Ok(transformed);
         }
         if let Some(new_expression) = transform_child_rec(expression, pre, post)? {
             // must propagate new expression tree
@@ -1391,6 +1469,9 @@ where
         RevsetExpression::None => RevsetExpression::None.into(),
         RevsetExpression::All => RevsetExpression::All.into(),
         RevsetExpression::VisibleHeads => RevsetExpression::VisibleHeads.into(),
+        RevsetExpression::VisibleHeadsOrReferenced => {
+            RevsetExpression::VisibleHeadsOrReferenced.into()
+        }
         RevsetExpression::Root => RevsetExpression::Root.into(),
         RevsetExpression::Commits(ids) => RevsetExpression::Commits(ids.clone()).into(),
         RevsetExpression::CommitRef(commit_ref) => folder.fold_commit_ref(commit_ref)?,
@@ -1433,6 +1514,21 @@ where
             let heads = folder.fold_expression(heads)?;
             RevsetExpression::Heads(heads).into()
         }
+        RevsetExpression::HeadsRange {
+            roots,
+            heads,
+            filter,
+        } => {
+            let roots = folder.fold_expression(roots)?;
+            let heads = folder.fold_expression(heads)?;
+            let filter = folder.fold_expression(filter)?;
+            RevsetExpression::HeadsRange {
+                roots,
+                heads,
+                filter,
+            }
+            .into()
+        }
         RevsetExpression::Roots(roots) => {
             let roots = folder.fold_expression(roots)?;
             RevsetExpression::Roots(roots).into()
@@ -1455,6 +1551,18 @@ where
             operation,
             candidates,
         } => folder.fold_at_operation(operation, candidates)?,
+        RevsetExpression::WithinReference {
+            candidates,
+            commits,
+        } => {
+            let candidates = folder.fold_expression(candidates)?;
+            let commits = commits.clone();
+            RevsetExpression::WithinReference {
+                candidates,
+                commits,
+            }
+            .into()
+        }
         RevsetExpression::WithinVisibility {
             candidates,
             visible_heads,
@@ -1499,6 +1607,171 @@ where
     Ok(expression)
 }
 
+/// Collects explicitly-referenced commits, inserts marker nodes.
+///
+/// User symbols and `at_operation()` scopes should have been resolved.
+fn resolve_referenced_commits<St: ExpressionState>(
+    expression: &Rc<RevsetExpression<St>>,
+) -> TransformedExpression<St> {
+    // Trust precomputed value if any
+    if matches!(
+        expression.as_ref(),
+        RevsetExpression::WithinReference { .. }
+    ) {
+        return None;
+    }
+
+    // Use separate Vec to get around borrowing issue
+    let mut inner_commits = Vec::new();
+    let mut outer_commits = Vec::new();
+    let transformed = transform_expression(
+        expression,
+        |expression| match expression.as_ref() {
+            // Trust precomputed value
+            RevsetExpression::WithinReference { commits, .. } => {
+                inner_commits.extend_from_slice(commits);
+                ControlFlow::Break(None)
+            }
+            // at_operation() scope shouldn't be affected by outer
+            RevsetExpression::WithinVisibility {
+                candidates,
+                visible_heads,
+            } => {
+                // ::visible_heads shouldn't be filtered out by outer
+                inner_commits.extend_from_slice(visible_heads);
+                let transformed = resolve_referenced_commits(candidates);
+                // Referenced commits shouldn't be filtered out by outer
+                if let RevsetExpression::WithinReference { commits, .. } =
+                    transformed.as_deref().unwrap_or(candidates)
+                {
+                    inner_commits.extend_from_slice(commits);
+                }
+                ControlFlow::Break(transformed.map(|candidates| {
+                    Rc::new(RevsetExpression::WithinVisibility {
+                        candidates,
+                        visible_heads: visible_heads.clone(),
+                    })
+                }))
+            }
+            _ => ControlFlow::Continue(()),
+        },
+        |expression| {
+            if let RevsetExpression::Commits(commits) = expression.as_ref() {
+                outer_commits.extend_from_slice(commits);
+            }
+            None
+        },
+    );
+
+    // Commits could be deduplicated here, but they'll be concatenated with
+    // the visible heads later, which may have duplicates.
+    outer_commits.extend(inner_commits);
+    if outer_commits.is_empty() {
+        // Omit empty node to keep test/debug output concise
+        return transformed;
+    }
+    Some(Rc::new(RevsetExpression::WithinReference {
+        candidates: transformed.unwrap_or_else(|| expression.clone()),
+        commits: outer_commits,
+    }))
+}
+
+/// Flatten all intersections to be left-recursive. For instance, transforms
+/// `(a & b) & (c & d)` into `((a & b) & c) & d`.
+fn flatten_intersections<St: ExpressionState>(
+    expression: &Rc<RevsetExpression<St>>,
+) -> TransformedExpression<St> {
+    fn flatten<St: ExpressionState>(
+        expression1: &Rc<RevsetExpression<St>>,
+        expression2: &Rc<RevsetExpression<St>>,
+    ) -> TransformedExpression<St> {
+        let recurse = |a, b| flatten(a, b).unwrap_or_else(|| a.intersection(b));
+
+        match expression2.as_ref() {
+            // flatten(a & (b & c)) -> flatten(a & b) & c
+            RevsetExpression::Intersection(inner1, inner2) => {
+                Some(recurse(expression1, inner1).intersection(inner2))
+            }
+            _ => None,
+        }
+    }
+
+    transform_expression_bottom_up(expression, |expression| match expression.as_ref() {
+        RevsetExpression::Intersection(expression1, expression2) => {
+            flatten(expression1, expression2)
+        }
+        _ => None,
+    })
+}
+
+/// Intersects `expression` with `base`, maintaining sorted order using the
+/// provided key. If `base` is an intersection, it must be left-recursive, and
+/// it must already be in sorted order.
+fn sort_intersection_by_key<St: ExpressionState, T: Ord>(
+    base: &Rc<RevsetExpression<St>>,
+    expression: &Rc<RevsetExpression<St>>,
+    mut get_key: impl FnMut(&RevsetExpression<St>) -> T,
+) -> TransformedExpression<St> {
+    // We only want to compute the key for `expression` once instead of computing it
+    // on every iteration.
+    fn sort_intersection_helper<St: ExpressionState, T: Ord>(
+        base: &Rc<RevsetExpression<St>>,
+        expression: &Rc<RevsetExpression<St>>,
+        expression_key: T,
+        mut get_key: impl FnMut(&RevsetExpression<St>) -> T,
+    ) -> TransformedExpression<St> {
+        if let RevsetExpression::Intersection(inner1, inner2) = base.as_ref() {
+            // sort_intersection(a & b, c) -> sort_intersection(a, c) & b
+            (expression_key < get_key(inner2)).then(|| {
+                sort_intersection_helper(inner1, expression, expression_key, get_key)
+                    .unwrap_or_else(|| inner1.intersection(expression))
+                    .intersection(inner2)
+            })
+        } else {
+            // a & b -> b & a
+            (expression_key < get_key(base)).then(|| expression.intersection(base))
+        }
+    }
+
+    sort_intersection_helper(base, expression, get_key(expression), get_key)
+}
+
+/// Push `ancestors(x)` and `~ancestors(x)` down (to the left) in intersections.
+/// All `~ancestors(x)` will be moved before `ancestors(x)`, since negated
+/// ancestors can be converted to ranges. All other negations are moved to the
+/// right, since these negations can usually be evaluated better as differences.
+fn sort_negations_and_ancestors<St: ExpressionState>(
+    expression: &Rc<RevsetExpression<St>>,
+) -> TransformedExpression<St> {
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum AncestorsOrder {
+        NegatedAncestors,
+        Ancestors,
+        Other,
+        NegatedOther,
+    }
+
+    transform_expression_bottom_up(expression, |expression| match expression.as_ref() {
+        RevsetExpression::Intersection(expression1, expression2) => {
+            sort_intersection_by_key(expression1, expression2, |expression| match expression {
+                RevsetExpression::Ancestors {
+                    generation: Range { end: u64::MAX, .. },
+                    ..
+                } => AncestorsOrder::Ancestors,
+                RevsetExpression::NotIn(complement) => match complement.as_ref() {
+                    RevsetExpression::Ancestors {
+                        generation: Range { end: u64::MAX, .. },
+                        ..
+                    } => AncestorsOrder::NegatedAncestors,
+                    _ => AncestorsOrder::NegatedOther,
+                },
+                _ => AncestorsOrder::Other,
+            })
+        }
+        _ => None,
+    })
+}
+
 /// Transforms filter expressions, by applying the following rules.
 ///
 /// a. Moves as many sets to left of filter intersection as possible, to
@@ -1510,72 +1783,57 @@ where
 fn internalize_filter<St: ExpressionState>(
     expression: &Rc<RevsetExpression<St>>,
 ) -> TransformedExpression<St> {
-    fn is_filter<St: ExpressionState>(expression: &RevsetExpression<St>) -> bool {
-        matches!(
-            expression,
-            RevsetExpression::Filter(_) | RevsetExpression::AsFilter(_)
-        )
-    }
-
-    fn is_filter_tree<St: ExpressionState>(expression: &RevsetExpression<St>) -> bool {
-        is_filter(expression) || as_filter_intersection(expression).is_some()
-    }
-
-    // Extracts 'c & f' from intersect_down()-ed node.
-    #[expect(clippy::type_complexity)]
-    fn as_filter_intersection<St: ExpressionState>(
-        expression: &RevsetExpression<St>,
-    ) -> Option<(&Rc<RevsetExpression<St>>, &Rc<RevsetExpression<St>>)> {
-        if let RevsetExpression::Intersection(expression1, expression2) = expression {
-            is_filter(expression2).then_some((expression1, expression2))
-        } else {
-            None
+    fn get_filter<St: ExpressionState>(
+        expression: &Rc<RevsetExpression<St>>,
+    ) -> Option<&Rc<RevsetExpression<St>>> {
+        match expression.as_ref() {
+            RevsetExpression::Filter(_) => Some(expression),
+            RevsetExpression::AsFilter(candidates) => Some(candidates),
+            _ => None,
         }
     }
 
-    // Since both sides must have already been intersect_down()-ed, we don't need to
-    // apply the whole bottom-up pass to new intersection node. Instead, just push
-    // new 'c & (d & g)' down-left to '(c & d) & g' while either side is
-    // an intersection of filter node.
-    fn intersect_down<St: ExpressionState>(
-        expression1: &Rc<RevsetExpression<St>>,
-        expression2: &Rc<RevsetExpression<St>>,
-    ) -> TransformedExpression<St> {
-        let recurse = |e1, e2| intersect_down(e1, e2).unwrap_or_else(|| e1.intersection(e2));
-        match (expression1.as_ref(), expression2.as_ref()) {
-            // Don't reorder 'f1 & f2'
-            (_, e2) if is_filter(e2) => None,
-            // f1 & e2 -> e2 & f1
-            (e1, _) if is_filter(e1) => Some(expression2.intersection(expression1)),
-            (e1, e2) => match (as_filter_intersection(e1), as_filter_intersection(e2)) {
-                // e1 & (c2 & f2) -> (e1 & c2) & f2
-                // (c1 & f1) & (c2 & f2) -> ((c1 & f1) & c2) & f2 -> ((c1 & c2) & f1) & f2
-                (_, Some((c2, f2))) => Some(recurse(expression1, c2).intersection(f2)),
-                // (c1 & f1) & e2 -> (c1 & e2) & f1
-                // ((c1 & f1) & g1) & e2 -> ((c1 & f1) & e2) & g1 -> ((c1 & e2) & f1) & g1
-                (Some((c1, f1)), _) => Some(recurse(c1, expression2).intersection(f1)),
-                (None, None) => None,
-            },
-        }
+    fn mark_filter<St: ExpressionState>(
+        expression: Rc<RevsetExpression<St>>,
+    ) -> Rc<RevsetExpression<St>> {
+        Rc::new(RevsetExpression::AsFilter(expression))
     }
 
-    // Bottom-up pass pulls up-right filter node from leaf '(c & f) & e' ->
-    // '(c & e) & f', so that an intersection of filter node can be found as
-    // a direct child of another intersection node. However, the rewritten
-    // intersection node 'c & e' can also be a rewrite target if 'e' contains
-    // a filter node. That's why intersect_down() is also recursive.
     transform_expression_bottom_up(expression, |expression| match expression.as_ref() {
-        RevsetExpression::Present(e) => {
-            is_filter_tree(e).then(|| Rc::new(RevsetExpression::AsFilter(expression.clone())))
+        // Mark expression as filter if any of the child nodes are filter.
+        RevsetExpression::Present(e) => get_filter(e).map(|f| mark_filter(f.present())),
+        RevsetExpression::NotIn(e) => get_filter(e).map(|f| mark_filter(f.negated())),
+        RevsetExpression::Union(e1, e2) => {
+            let f1 = get_filter(e1);
+            let f2 = get_filter(e2);
+            (f1.is_some() || f2.is_some())
+                .then(|| mark_filter(f1.unwrap_or(e1).union(f2.unwrap_or(e2))))
         }
-        RevsetExpression::NotIn(e) => {
-            is_filter_tree(e).then(|| Rc::new(RevsetExpression::AsFilter(expression.clone())))
-        }
-        RevsetExpression::Union(e1, e2) => (is_filter_tree(e1) || is_filter_tree(e2))
-            .then(|| Rc::new(RevsetExpression::AsFilter(expression.clone()))),
-        RevsetExpression::Intersection(expression1, expression2) => {
-            intersect_down(expression1, expression2)
-        }
+        // Bottom-up pass pulls up-right filter node from leaf '(c & f) & e' ->
+        // '(c & e) & f', so that an intersection of filter node can be found as
+        // a direct child of another intersection node. Suppose intersection is
+        // left-recursive, e2 shouldn't be an intersection node. e1 may be set,
+        // filter, (set & filter), ((set & set) & filter), ...
+        RevsetExpression::Intersection(e1, e2) => match (get_filter(e1), get_filter(e2)) {
+            // f1 & f2 -> filter(f1 & f2)
+            (Some(f1), Some(f2)) => Some(mark_filter(f1.intersection(f2))),
+            // f1 & s2 -> s2 & filter(f1)
+            (Some(_), None) => Some(e2.intersection(e1)),
+            // (s1a & f1b) & f2 -> s1a & filter(f1b & f2)
+            (None, Some(f2)) => match e1.as_ref() {
+                RevsetExpression::Intersection(e1a, e1b) => {
+                    get_filter(e1b).map(|f1b| e1a.intersection(&mark_filter(f1b.intersection(f2))))
+                }
+                _ => None,
+            },
+            // (s1a & f1b) & s2 -> (s1a & s2) & filter(f1b)
+            (None, None) => match e1.as_ref() {
+                RevsetExpression::Intersection(e1a, e1b) => {
+                    get_filter(e1b).map(|_| e1a.intersection(e2).intersection(e1b))
+                }
+                _ => None,
+            },
+        },
         // Difference(e1, e2) should have been unfolded to Intersection(e1, NotIn(e2)).
         _ => None,
     })
@@ -1583,8 +1841,8 @@ fn internalize_filter<St: ExpressionState>(
 
 /// Eliminates redundant nodes like `x & all()`, `~~x`.
 ///
-/// This does not rewrite 'x & none()' to 'none()' because 'x' may be an invalid
-/// symbol.
+/// Since this function rewrites `x & none()` to `none()`, user symbols should
+/// have been resolved. Otherwise, an invalid symbol could be optimized out.
 fn fold_redundant_expression<St: ExpressionState>(
     expression: &Rc<RevsetExpression<St>>,
 ) -> TransformedExpression<St> {
@@ -1593,8 +1851,19 @@ fn fold_redundant_expression<St: ExpressionState>(
             RevsetExpression::NotIn(inner) => Some(inner.clone()),
             _ => None,
         },
+        RevsetExpression::Union(expression1, expression2) => {
+            match (expression1.as_ref(), expression2.as_ref()) {
+                (_, RevsetExpression::None) => Some(expression1.clone()),
+                (RevsetExpression::None, _) => Some(expression2.clone()),
+                (RevsetExpression::All, _) => Some(RevsetExpression::all()),
+                (_, RevsetExpression::All) => Some(RevsetExpression::all()),
+                _ => None,
+            }
+        }
         RevsetExpression::Intersection(expression1, expression2) => {
             match (expression1.as_ref(), expression2.as_ref()) {
+                (RevsetExpression::None, _) => Some(RevsetExpression::none()),
+                (_, RevsetExpression::None) => Some(RevsetExpression::none()),
                 (_, RevsetExpression::All) => Some(expression1.clone()),
                 (RevsetExpression::All, _) => Some(expression2.clone()),
                 _ => None,
@@ -1604,41 +1873,178 @@ fn fold_redundant_expression<St: ExpressionState>(
     })
 }
 
+/// Extracts `heads` from a revset expression `ancestors(heads)`. Unfolds
+/// generations as necessary, so `ancestors(heads, 2..)` would return
+/// `ancestors(heads, 2..3)`, which is equivalent to `heads--`.
+fn ancestors_to_heads<St: ExpressionState>(
+    expression: &RevsetExpression<St>,
+) -> Result<Rc<RevsetExpression<St>>, ()> {
+    match expression {
+        RevsetExpression::Ancestors {
+            heads,
+            generation: GENERATION_RANGE_FULL,
+        } => Ok(heads.clone()),
+        RevsetExpression::Ancestors {
+            heads,
+            generation: Range {
+                start,
+                end: u64::MAX,
+            },
+        } => Ok(heads.ancestors_at(*start)),
+        _ => Err(()),
+    }
+}
+
+/// Folds `::x | ::y` into `::(x | y)`, and `~::x & ~::y` into `~::(x | y)`.
+/// Does not fold intersections of negations involving non-ancestors
+/// expressions, since this can result in less efficient evaluation, such as for
+/// `~::x & ~y`, which should be `x.. ~ y` instead of `~(::x | y)`.
+fn fold_ancestors_union<St: ExpressionState>(
+    expression: &Rc<RevsetExpression<St>>,
+) -> TransformedExpression<St> {
+    fn union_ancestors<St: ExpressionState>(
+        expression1: &Rc<RevsetExpression<St>>,
+        expression2: &Rc<RevsetExpression<St>>,
+    ) -> TransformedExpression<St> {
+        let heads1 = ancestors_to_heads(expression1).ok()?;
+        let heads2 = ancestors_to_heads(expression2).ok()?;
+        Some(heads1.union(&heads2).ancestors())
+    }
+
+    transform_expression_bottom_up(expression, |expression| match expression.as_ref() {
+        RevsetExpression::Union(expression1, expression2) => {
+            // ::x | ::y -> ::(x | y)
+            union_ancestors(expression1, expression2)
+        }
+        RevsetExpression::Intersection(expression1, expression2) => {
+            match (expression1.as_ref(), expression2.as_ref()) {
+                // ~::x & ~::y -> ~(::x | ::y) -> ~::(x | y)
+                (RevsetExpression::NotIn(complement1), RevsetExpression::NotIn(complement2)) => {
+                    union_ancestors(complement1, complement2).map(|expression| expression.negated())
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    })
+}
+
+/// Transforms expressions like `heads(roots..heads & filters)` into a combined
+/// operation where possible. Ancestors and negated ancestors should have
+/// already been moved to the left in intersections, and negated ancestors
+/// should have been combined already.
+fn fold_heads_range<St: ExpressionState>(
+    expression: &Rc<RevsetExpression<St>>,
+) -> TransformedExpression<St> {
+    // Represents `roots..heads & filter`
+    struct FilteredRange<St: ExpressionState> {
+        roots: Rc<RevsetExpression<St>>,
+        heads: Option<Rc<RevsetExpression<St>>>,
+        filter: Rc<RevsetExpression<St>>,
+    }
+
+    impl<St: ExpressionState> FilteredRange<St> {
+        fn new(roots: Rc<RevsetExpression<St>>) -> Self {
+            // roots.. & all()
+            Self {
+                roots,
+                heads: None,
+                filter: RevsetExpression::all(),
+            }
+        }
+
+        fn add(mut self, expression: &Rc<RevsetExpression<St>>) -> Self {
+            if self.heads.is_none() {
+                // x.. & ::y -> x..y
+                if let Ok(heads) = ancestors_to_heads(expression) {
+                    self.heads = Some(heads);
+                    return self;
+                }
+            }
+            self.add_filter(expression)
+        }
+
+        fn add_filter(mut self, expression: &Rc<RevsetExpression<St>>) -> Self {
+            if let RevsetExpression::All = self.filter.as_ref() {
+                // x..y & all() & f -> x..y & f
+                self.filter = expression.clone();
+            } else {
+                self.filter = self.filter.intersection(expression);
+            }
+            self
+        }
+    }
+
+    fn to_filtered_range<St: ExpressionState>(
+        expression: &Rc<RevsetExpression<St>>,
+    ) -> Option<FilteredRange<St>> {
+        // If the first expression is `ancestors(x)`, then we already know the range
+        // must be `none()..x`, since any roots would've been moved to the left by an
+        // earlier pass.
+        if let Ok(heads) = ancestors_to_heads(expression) {
+            return Some(FilteredRange {
+                roots: RevsetExpression::none(),
+                heads: Some(heads),
+                filter: RevsetExpression::all(),
+            });
+        }
+        match expression.as_ref() {
+            // All roots should have been moved to the start of the intersection by an earlier pass,
+            // so we can set the roots based on the first expression in the intersection.
+            RevsetExpression::NotIn(complement) => {
+                if let Ok(roots) = ancestors_to_heads(complement) {
+                    Some(FilteredRange::new(roots))
+                } else {
+                    // If the first expression is a non-ancestors negation, we still want to use
+                    // `HeadsRange` since `~x` is equivalent to `::visible_heads() ~ x`.
+                    Some(FilteredRange::new(RevsetExpression::none()).add_filter(expression))
+                }
+            }
+            // We also want to optimize `heads()` if the first expression is `all()` or a filter.
+            RevsetExpression::All | RevsetExpression::Filter(_) | RevsetExpression::AsFilter(_) => {
+                Some(FilteredRange::new(RevsetExpression::none()).add_filter(expression))
+            }
+            // We only need to handle intersections recursively. Differences will have been
+            // unfolded already.
+            RevsetExpression::Intersection(expression1, expression2) => {
+                to_filtered_range(expression1).map(|filtered_range| filtered_range.add(expression2))
+            }
+            _ => None,
+        }
+    }
+
+    transform_expression_bottom_up(expression, |expression| match expression.as_ref() {
+        RevsetExpression::Heads(candidates) => {
+            to_filtered_range(candidates).map(|filtered_range| {
+                RevsetExpression::HeadsRange {
+                    roots: filtered_range.roots,
+                    heads: filtered_range
+                        .heads
+                        .unwrap_or_else(RevsetExpression::visible_heads_or_referenced),
+                    filter: filtered_range.filter,
+                }
+                .into()
+            })
+        }
+        _ => None,
+    })
+}
+
 fn to_difference_range<St: ExpressionState>(
     expression: &Rc<RevsetExpression<St>>,
     complement: &Rc<RevsetExpression<St>>,
 ) -> TransformedExpression<St> {
-    match (expression.as_ref(), complement.as_ref()) {
-        // ::heads & ~(::roots) -> roots..heads
-        (
-            RevsetExpression::Ancestors { heads, generation },
-            RevsetExpression::Ancestors {
-                heads: roots,
-                generation: GENERATION_RANGE_FULL,
-            },
-        ) => Some(Rc::new(RevsetExpression::Range {
-            roots: roots.clone(),
-            heads: heads.clone(),
-            generation: generation.clone(),
-        })),
-        // ::heads & ~(::roots-) -> ::heads & ~ancestors(roots, 1..) -> roots-..heads
-        (
-            RevsetExpression::Ancestors { heads, generation },
-            RevsetExpression::Ancestors {
-                heads: roots,
-                generation:
-                    Range {
-                        start: roots_start,
-                        end: u64::MAX,
-                    },
-            },
-        ) => Some(Rc::new(RevsetExpression::Range {
-            roots: roots.ancestors_at(*roots_start),
-            heads: heads.clone(),
-            generation: generation.clone(),
-        })),
-        _ => None,
-    }
+    let RevsetExpression::Ancestors { heads, generation } = expression.as_ref() else {
+        return None;
+    };
+    let roots = ancestors_to_heads(complement).ok()?;
+    // ::heads & ~(::roots) -> roots..heads
+    // ::heads & ~(::roots-) -> ::heads & ~ancestors(roots, 1..) -> roots-..heads
+    Some(Rc::new(RevsetExpression::Range {
+        roots,
+        heads: heads.clone(),
+        generation: generation.clone(),
+    }))
 }
 
 /// Transforms negative intersection to difference. Redundant intersections like
@@ -1684,7 +2090,10 @@ fn fold_not_in_ancestors<St: ExpressionState>(
         {
             // ~(::heads) -> heads..
             // ~(::heads-) -> ~ancestors(heads, 1..) -> heads-..
-            to_difference_range(&RevsetExpression::visible_heads().ancestors(), complement)
+            to_difference_range(
+                &RevsetExpression::visible_heads_or_referenced().ancestors(),
+                complement,
+            )
         }
         _ => None,
     })
@@ -1780,10 +2189,17 @@ fn fold_generation<St: ExpressionState>(
 pub fn optimize<St: ExpressionState>(
     expression: Rc<RevsetExpression<St>>,
 ) -> Rc<RevsetExpression<St>> {
+    // Since fold_redundant_expression() can remove hidden commits that look
+    // redundant, referenced commits should be collected earlier.
+    let expression = resolve_referenced_commits(&expression).unwrap_or(expression);
     let expression = unfold_difference(&expression).unwrap_or(expression);
     let expression = fold_redundant_expression(&expression).unwrap_or(expression);
     let expression = fold_generation(&expression).unwrap_or(expression);
+    let expression = flatten_intersections(&expression).unwrap_or(expression);
+    let expression = sort_negations_and_ancestors(&expression).unwrap_or(expression);
     let expression = internalize_filter(&expression).unwrap_or(expression);
+    let expression = fold_ancestors_union(&expression).unwrap_or(expression);
+    let expression = fold_heads_range(&expression).unwrap_or(expression);
     let expression = fold_difference(&expression).unwrap_or(expression);
     fold_not_in_ancestors(&expression).unwrap_or(expression)
 }
@@ -2253,7 +2669,7 @@ fn resolve_symbols(
 ///
 /// Symbols and commit refs in the `expression` should have been resolved.
 ///
-/// This is a separate step because a symbol-resolved `expression` could be
+/// This is a separate step because a symbol-resolved `expression` may be
 /// transformed further to e.g. combine OR-ed `Commits(_)`, or to collect
 /// commit ids to make `all()` include hidden-but-specified commits. The
 /// return type `ResolvedExpression` is stricter than `RevsetExpression`,
@@ -2263,6 +2679,7 @@ fn resolve_visibility(
     expression: &ResolvedRevsetExpression,
 ) -> ResolvedExpression {
     let context = VisibilityResolutionContext {
+        referenced_commits: &[],
         visible_heads: &repo.view().heads().iter().cloned().collect_vec(),
         root: repo.store().root_commit_id(),
     };
@@ -2271,6 +2688,7 @@ fn resolve_visibility(
 
 #[derive(Clone, Debug)]
 struct VisibilityResolutionContext<'a> {
+    referenced_commits: &'a [CommitId],
     visible_heads: &'a [CommitId],
     root: &'a CommitId,
 }
@@ -2282,6 +2700,9 @@ impl VisibilityResolutionContext<'_> {
             RevsetExpression::None => ResolvedExpression::Commits(vec![]),
             RevsetExpression::All => self.resolve_all(),
             RevsetExpression::VisibleHeads => self.resolve_visible_heads(),
+            RevsetExpression::VisibleHeadsOrReferenced => {
+                self.resolve_visible_heads_or_referenced()
+            }
             RevsetExpression::Root => self.resolve_root(),
             RevsetExpression::Commits(commit_ids) => {
                 ResolvedExpression::Commits(commit_ids.clone())
@@ -2293,7 +2714,7 @@ impl VisibilityResolutionContext<'_> {
             },
             RevsetExpression::Descendants { roots, generation } => ResolvedExpression::DagRange {
                 roots: self.resolve(roots).into(),
-                heads: self.resolve_visible_heads().into(),
+                heads: self.resolve_visible_heads_or_referenced().into(),
                 generation_from_roots: generation.clone(),
             },
             RevsetExpression::Range {
@@ -2317,6 +2738,16 @@ impl VisibilityResolutionContext<'_> {
             RevsetExpression::Heads(candidates) => {
                 ResolvedExpression::Heads(self.resolve(candidates).into())
             }
+            RevsetExpression::HeadsRange {
+                roots,
+                heads,
+                filter,
+            } => ResolvedExpression::HeadsRange {
+                roots: self.resolve(roots).into(),
+                heads: self.resolve(heads).into(),
+                filter: (!matches!(filter.as_ref(), RevsetExpression::All))
+                    .then(|| self.resolve_predicate(filter)),
+            },
             RevsetExpression::Roots(candidates) => {
                 ResolvedExpression::Roots(self.resolve(candidates).into())
             }
@@ -2336,11 +2767,23 @@ impl VisibilityResolutionContext<'_> {
                 }
             }
             RevsetExpression::AtOperation { operation, .. } => match *operation {},
+            RevsetExpression::WithinReference {
+                candidates,
+                commits,
+            } => {
+                let context = VisibilityResolutionContext {
+                    referenced_commits: commits,
+                    visible_heads: self.visible_heads,
+                    root: self.root,
+                };
+                context.resolve(candidates)
+            }
             RevsetExpression::WithinVisibility {
                 candidates,
                 visible_heads,
             } => {
                 let context = VisibilityResolutionContext {
+                    referenced_commits: self.referenced_commits,
                     visible_heads,
                     root: self.root,
                 };
@@ -2384,21 +2827,25 @@ impl VisibilityResolutionContext<'_> {
     }
 
     fn resolve_all(&self) -> ResolvedExpression {
-        // Since `all()` does not include hidden commits, some of the logical
-        // transformation rules may subtly change the evaluated set. For example,
-        // `all() & x` is not `x` if `x` is hidden. This wouldn't matter in practice,
-        // but if it does, the heads set could be extended to include the commits
-        // (and `remote_bookmarks()`) specified in the revset expression. Alternatively,
-        // some optimization rules could be removed, but that means `author(_) & x`
-        // would have to test `::visible_heads() & x`.
         ResolvedExpression::Ancestors {
-            heads: self.resolve_visible_heads().into(),
+            heads: self.resolve_visible_heads_or_referenced().into(),
             generation: GENERATION_RANGE_FULL,
         }
     }
 
     fn resolve_visible_heads(&self) -> ResolvedExpression {
         ResolvedExpression::Commits(self.visible_heads.to_owned())
+    }
+
+    fn resolve_visible_heads_or_referenced(&self) -> ResolvedExpression {
+        // The referenced commits may be hidden. If they weren't included in
+        // `all()`, some of the logical transformation rules might subtly change
+        // the evaluated set. For example, `all() & x` wouldn't be `x` if `x`
+        // were hidden and if not included in `all()`.
+        let commits = itertools::chain(self.referenced_commits, self.visible_heads)
+            .cloned()
+            .collect();
+        ResolvedExpression::Commits(commits)
     }
 
     fn resolve_root(&self) -> ResolvedExpression {
@@ -2417,6 +2864,7 @@ impl VisibilityResolutionContext<'_> {
             RevsetExpression::None
             | RevsetExpression::All
             | RevsetExpression::VisibleHeads
+            | RevsetExpression::VisibleHeadsOrReferenced
             | RevsetExpression::Root
             | RevsetExpression::Commits(_)
             | RevsetExpression::CommitRef(_)
@@ -2426,6 +2874,7 @@ impl VisibilityResolutionContext<'_> {
             | RevsetExpression::DagRange { .. }
             | RevsetExpression::Reachable { .. }
             | RevsetExpression::Heads(_)
+            | RevsetExpression::HeadsRange { .. }
             | RevsetExpression::Roots(_)
             | RevsetExpression::ForkPoint(_)
             | RevsetExpression::Latest { .. } => {
@@ -2437,7 +2886,8 @@ impl VisibilityResolutionContext<'_> {
             RevsetExpression::AsFilter(candidates) => self.resolve_predicate(candidates),
             RevsetExpression::AtOperation { operation, .. } => match *operation {},
             // Filters should be intersected with all() within the at-op repo.
-            RevsetExpression::WithinVisibility { .. } => {
+            RevsetExpression::WithinReference { .. }
+            | RevsetExpression::WithinVisibility { .. } => {
                 ResolvedPredicateExpression::Set(self.resolve(expression).into())
             }
             RevsetExpression::Coalesce(_, _) => {
@@ -2453,10 +2903,16 @@ impl VisibilityResolutionContext<'_> {
                 let predicate2 = self.resolve_predicate(expression2);
                 ResolvedPredicateExpression::Union(predicate1.into(), predicate2.into())
             }
-            // Intersection of filters should have been substituted by optimize().
-            // If it weren't, just fall back to the set evaluation path.
-            RevsetExpression::Intersection(..) | RevsetExpression::Difference(..) => {
-                ResolvedPredicateExpression::Set(self.resolve(expression).into())
+            RevsetExpression::Intersection(expression1, expression2) => {
+                let predicate1 = self.resolve_predicate(expression1);
+                let predicate2 = self.resolve_predicate(expression2);
+                ResolvedPredicateExpression::Intersection(predicate1.into(), predicate2.into())
+            }
+            RevsetExpression::Difference(expression1, expression2) => {
+                let predicate1 = self.resolve_predicate(expression1);
+                let predicate2 = self.resolve_predicate(expression2);
+                let predicate2 = ResolvedPredicateExpression::NotIn(predicate2.into());
+                ResolvedPredicateExpression::Intersection(predicate1.into(), predicate2.into())
             }
         }
     }
@@ -3055,11 +3511,12 @@ mod tests {
         }
         "#);
         insta::assert_debug_snapshot!(parse("foo..").unwrap(), @r#"
-        Range {
-            roots: CommitRef(Symbol("foo")),
-            heads: VisibleHeads,
-            generation: 0..18446744073709551615,
-        }
+        NotIn(
+            Ancestors {
+                heads: CommitRef(Symbol("foo")),
+                generation: 0..18446744073709551615,
+            },
+        )
         "#);
         insta::assert_debug_snapshot!(parse("foo..bar").unwrap(), @r#"
         Range {
@@ -3069,13 +3526,7 @@ mod tests {
         }
         "#);
         // Parse the nullary "range" operator
-        insta::assert_debug_snapshot!(parse("..").unwrap(), @r"
-        Range {
-            roots: Root,
-            heads: VisibleHeads,
-            generation: 0..18446744073709551615,
-        }
-        ");
+        insta::assert_debug_snapshot!(parse("..").unwrap(), @r#"NotIn(Root)"#);
         // Parse the "negate" operator
         insta::assert_debug_snapshot!(
             parse("~ foo").unwrap(),
@@ -3430,6 +3881,281 @@ mod tests {
     }
 
     #[test]
+    fn test_transform_expression() {
+        let settings = insta_settings();
+        let _guard = settings.bind_to_scope();
+
+        // Break without pre transformation
+        insta::assert_debug_snapshot!(
+            transform_expression(
+                &ResolvedRevsetExpression::root(),
+                |_| ControlFlow::Break(None),
+                |_| Some(RevsetExpression::none()),
+            ), @"None");
+
+        // Break with pre transformation
+        insta::assert_debug_snapshot!(
+            transform_expression(
+                &ResolvedRevsetExpression::root(),
+                |_| ControlFlow::Break(Some(RevsetExpression::all())),
+                |_| Some(RevsetExpression::none()),
+            ), @"Some(All)");
+
+        // Continue without pre transformation, do transform child
+        insta::assert_debug_snapshot!(
+            transform_expression(
+                &ResolvedRevsetExpression::root().heads(),
+                |_| ControlFlow::Continue(()),
+                |x| match x.as_ref() {
+                    RevsetExpression::Root => Some(RevsetExpression::none()),
+                    _ => None,
+                },
+            ), @"Some(Heads(None))");
+
+        // Continue without pre transformation, do transform self
+        insta::assert_debug_snapshot!(
+            transform_expression(
+                &ResolvedRevsetExpression::root().heads(),
+                |_| ControlFlow::Continue(()),
+                |x| match x.as_ref() {
+                    RevsetExpression::Heads(y) => Some(y.clone()),
+                    _ => None,
+                },
+            ), @"Some(Root)");
+    }
+
+    #[test]
+    fn test_resolve_referenced_commits() {
+        let settings = insta_settings();
+        let _guard = settings.bind_to_scope();
+
+        let visibility1 = Rc::new(ResolvedRevsetExpression::WithinVisibility {
+            candidates: RevsetExpression::commit(CommitId::from_hex("100001")),
+            visible_heads: vec![CommitId::from_hex("100000")],
+        });
+        let visibility2 = Rc::new(ResolvedRevsetExpression::WithinVisibility {
+            candidates: RevsetExpression::filter(RevsetFilterPredicate::HasConflict),
+            visible_heads: vec![CommitId::from_hex("200000")],
+        });
+        let commit3 = RevsetExpression::commit(CommitId::from_hex("000003"));
+
+        // Inner commits should be scoped. Both inner commits and visible heads
+        // should be added to the outer scope.
+        insta::assert_debug_snapshot!(
+            resolve_referenced_commits(&visibility1.intersection(&RevsetExpression::all())), @r#"
+        Some(
+            WithinReference {
+                candidates: Intersection(
+                    WithinVisibility {
+                        candidates: WithinReference {
+                            candidates: Commits(
+                                [
+                                    CommitId("100001"),
+                                ],
+                            ),
+                            commits: [
+                                CommitId("100001"),
+                            ],
+                        },
+                        visible_heads: [
+                            CommitId("100000"),
+                        ],
+                    },
+                    All,
+                ),
+                commits: [
+                    CommitId("100000"),
+                    CommitId("100001"),
+                ],
+            },
+        )
+        "#);
+
+        // Inner scope has no references, so WithinReference should be omitted.
+        insta::assert_debug_snapshot!(
+            resolve_referenced_commits(
+                &visibility2
+                    .intersection(&RevsetExpression::all())
+                    .union(&commit3),
+            ), @r#"
+        Some(
+            WithinReference {
+                candidates: Union(
+                    Intersection(
+                        WithinVisibility {
+                            candidates: Filter(HasConflict),
+                            visible_heads: [
+                                CommitId("200000"),
+                            ],
+                        },
+                        All,
+                    ),
+                    Commits(
+                        [
+                            CommitId("000003"),
+                        ],
+                    ),
+                ),
+                commits: [
+                    CommitId("000003"),
+                    CommitId("200000"),
+                ],
+            },
+        )
+        "#);
+
+        // Sibling scopes should track referenced commits individually.
+        insta::assert_debug_snapshot!(
+            resolve_referenced_commits(
+                &visibility1
+                    .union(&visibility2)
+                    .union(&commit3)
+                    .intersection(&RevsetExpression::all())
+            ), @r#"
+        Some(
+            WithinReference {
+                candidates: Intersection(
+                    Union(
+                        Union(
+                            WithinVisibility {
+                                candidates: WithinReference {
+                                    candidates: Commits(
+                                        [
+                                            CommitId("100001"),
+                                        ],
+                                    ),
+                                    commits: [
+                                        CommitId("100001"),
+                                    ],
+                                },
+                                visible_heads: [
+                                    CommitId("100000"),
+                                ],
+                            },
+                            WithinVisibility {
+                                candidates: Filter(HasConflict),
+                                visible_heads: [
+                                    CommitId("200000"),
+                                ],
+                            },
+                        ),
+                        Commits(
+                            [
+                                CommitId("000003"),
+                            ],
+                        ),
+                    ),
+                    All,
+                ),
+                commits: [
+                    CommitId("000003"),
+                    CommitId("100000"),
+                    CommitId("100001"),
+                    CommitId("200000"),
+                ],
+            },
+        )
+        "#);
+
+        // Referenced commits should be propagated from the innermost scope.
+        insta::assert_debug_snapshot!(
+            resolve_referenced_commits(&Rc::new(ResolvedRevsetExpression::WithinVisibility {
+                candidates: visibility1.clone(),
+                visible_heads: vec![CommitId::from_hex("400000")],
+            })), @r#"
+        Some(
+            WithinReference {
+                candidates: WithinVisibility {
+                    candidates: WithinReference {
+                        candidates: WithinVisibility {
+                            candidates: WithinReference {
+                                candidates: Commits(
+                                    [
+                                        CommitId("100001"),
+                                    ],
+                                ),
+                                commits: [
+                                    CommitId("100001"),
+                                ],
+                            },
+                            visible_heads: [
+                                CommitId("100000"),
+                            ],
+                        },
+                        commits: [
+                            CommitId("100000"),
+                            CommitId("100001"),
+                        ],
+                    },
+                    visible_heads: [
+                        CommitId("400000"),
+                    ],
+                },
+                commits: [
+                    CommitId("400000"),
+                    CommitId("100000"),
+                    CommitId("100001"),
+                ],
+            },
+        )
+        "#);
+
+        // Resolved expression should be reused.
+        let resolved = Rc::new(ResolvedRevsetExpression::WithinReference {
+            // No referenced commits within the scope to test whether the
+            // precomputed value is reused.
+            candidates: RevsetExpression::none(),
+            commits: vec![CommitId::from_hex("100000")],
+        });
+        insta::assert_debug_snapshot!(
+            resolve_referenced_commits(&resolved), @"None");
+        insta::assert_debug_snapshot!(
+            resolve_referenced_commits(&resolved.intersection(&RevsetExpression::all())), @r#"
+        Some(
+            WithinReference {
+                candidates: Intersection(
+                    WithinReference {
+                        candidates: None,
+                        commits: [
+                            CommitId("100000"),
+                        ],
+                    },
+                    All,
+                ),
+                commits: [
+                    CommitId("100000"),
+                ],
+            },
+        )
+        "#);
+        insta::assert_debug_snapshot!(
+            resolve_referenced_commits(&Rc::new(ResolvedRevsetExpression::WithinVisibility {
+                candidates: resolved.clone(),
+                visible_heads: vec![CommitId::from_hex("400000")],
+            })), @r#"
+        Some(
+            WithinReference {
+                candidates: WithinVisibility {
+                    candidates: WithinReference {
+                        candidates: None,
+                        commits: [
+                            CommitId("100000"),
+                        ],
+                    },
+                    visible_heads: [
+                        CommitId("400000"),
+                    ],
+                },
+                commits: [
+                    CommitId("400000"),
+                    CommitId("100000"),
+                ],
+            },
+        )
+        "#);
+    }
+
+    #[test]
     fn test_optimize_subtree() {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
@@ -3518,13 +4244,30 @@ mod tests {
         }
         "#);
         insta::assert_debug_snapshot!(
+            optimize(Rc::new(RevsetExpression::WithinReference {
+                candidates: parse("bookmarks() & all()").unwrap(),
+                commits: vec![CommitId::from_hex("012345")],
+            })), @r#"
+        WithinReference {
+            candidates: CommitRef(Bookmarks(Substring(""))),
+            commits: [
+                CommitId("012345"),
+            ],
+        }
+        "#);
+        insta::assert_debug_snapshot!(
             optimize(Rc::new(RevsetExpression::WithinVisibility {
                 candidates: parse("bookmarks() & all()").unwrap(),
                 visible_heads: vec![CommitId::from_hex("012345")],
             })), @r#"
-        WithinVisibility {
-            candidates: CommitRef(Bookmarks(Substring(""))),
-            visible_heads: [
+        WithinReference {
+            candidates: WithinVisibility {
+                candidates: CommitRef(Bookmarks(Substring(""))),
+                visible_heads: [
+                    CommitId("012345"),
+                ],
+            },
+            commits: [
                 CommitId("012345"),
             ],
         }
@@ -3606,6 +4349,22 @@ mod tests {
     }
 
     #[test]
+    fn test_optimize_basic() {
+        let settings = insta_settings();
+        let _guard = settings.bind_to_scope();
+
+        insta::assert_debug_snapshot!(optimize(parse("all() | none()").unwrap()), @"All");
+        insta::assert_debug_snapshot!(optimize(parse("all() & none()").unwrap()), @"None");
+        insta::assert_debug_snapshot!(optimize(parse("root() | all()").unwrap()), @"All");
+        insta::assert_debug_snapshot!(optimize(parse("root() & all()").unwrap()), @"Root");
+        insta::assert_debug_snapshot!(optimize(parse("none() | root()").unwrap()), @"Root");
+        insta::assert_debug_snapshot!(optimize(parse("none() & root()").unwrap()), @"None");
+        insta::assert_debug_snapshot!(optimize(parse("~~none()").unwrap()), @"None");
+        insta::assert_debug_snapshot!(
+            optimize(parse("(root() | none()) & (visible_heads() | ~~all())").unwrap()), @"Root");
+    }
+
+    #[test]
     fn test_optimize_difference() {
         let settings = insta_settings();
         let _guard = settings.bind_to_scope();
@@ -3673,11 +4432,18 @@ mod tests {
         insta::assert_debug_snapshot!(optimize(parse("foo..").unwrap()), @r#"
         Range {
             roots: CommitRef(Symbol("foo")),
-            heads: VisibleHeads,
+            heads: VisibleHeadsOrReferenced,
             generation: 0..18446744073709551615,
         }
         "#);
         insta::assert_debug_snapshot!(optimize(parse("foo..bar").unwrap()), @r#"
+        Range {
+            roots: CommitRef(Symbol("foo")),
+            heads: CommitRef(Symbol("bar")),
+            generation: 0..18446744073709551615,
+        }
+        "#);
+        insta::assert_debug_snapshot!(optimize(parse("foo.. & ::bar").unwrap()), @r#"
         Range {
             roots: CommitRef(Symbol("foo")),
             heads: CommitRef(Symbol("bar")),
@@ -3712,6 +4478,52 @@ mod tests {
             CommitRef(Symbol("bar")),
         )
         "#);
+
+        // The roots of multiple ranges can be folded after being unfolded.
+        insta::assert_debug_snapshot!(optimize(parse("a..b & c..d").unwrap()), @r#"
+        Intersection(
+            Range {
+                roots: Union(
+                    CommitRef(Symbol("a")),
+                    CommitRef(Symbol("c")),
+                ),
+                heads: CommitRef(Symbol("b")),
+                generation: 0..18446744073709551615,
+            },
+            Ancestors {
+                heads: CommitRef(Symbol("d")),
+                generation: 0..18446744073709551615,
+            },
+        )
+        "#);
+
+        // Negated ancestors can be combined into a range regardless of intersection
+        // grouping order and intervening expressions.
+        insta::assert_debug_snapshot!(optimize(parse("foo ~ ::a & (::b & bar & ::c) & (baz ~ ::d)").unwrap()), @r#"
+        Intersection(
+            Intersection(
+                Intersection(
+                    Intersection(
+                        Range {
+                            roots: Union(
+                                CommitRef(Symbol("a")),
+                                CommitRef(Symbol("d")),
+                            ),
+                            heads: CommitRef(Symbol("b")),
+                            generation: 0..18446744073709551615,
+                        },
+                        Ancestors {
+                            heads: CommitRef(Symbol("c")),
+                            generation: 0..18446744073709551615,
+                        },
+                    ),
+                    CommitRef(Symbol("foo")),
+                ),
+                CommitRef(Symbol("bar")),
+            ),
+            CommitRef(Symbol("baz")),
+        )
+        "#);
     }
 
     #[test]
@@ -3723,7 +4535,7 @@ mod tests {
         insta::assert_debug_snapshot!(optimize(parse("~(::foo)").unwrap()), @r#"
         Range {
             roots: CommitRef(Symbol("foo")),
-            heads: VisibleHeads,
+            heads: VisibleHeadsOrReferenced,
             generation: 0..18446744073709551615,
         }
         "#);
@@ -3735,7 +4547,7 @@ mod tests {
                 heads: CommitRef(Symbol("foo")),
                 generation: 1..2,
             },
-            heads: VisibleHeads,
+            heads: VisibleHeadsOrReferenced,
             generation: 0..18446744073709551615,
         }
         "#);
@@ -3745,7 +4557,7 @@ mod tests {
                 heads: CommitRef(Symbol("foo")),
                 generation: 2..3,
             },
-            heads: VisibleHeads,
+            heads: VisibleHeadsOrReferenced,
             generation: 0..18446744073709551615,
         }
         "#);
@@ -3843,30 +4655,36 @@ mod tests {
         "#);
         insta::assert_debug_snapshot!(
             optimize(parse("author_name(foo) & committer_name(bar)").unwrap()), @r#"
-        Intersection(
-            Filter(AuthorName(Substring("foo"))),
-            Filter(CommitterName(Substring("bar"))),
+        AsFilter(
+            Intersection(
+                Filter(AuthorName(Substring("foo"))),
+                Filter(CommitterName(Substring("bar"))),
+            ),
         )
         "#);
 
         insta::assert_debug_snapshot!(
             optimize(parse("foo & description(bar) & author_name(baz)").unwrap()), @r#"
         Intersection(
-            Intersection(
-                CommitRef(Symbol("foo")),
-                Filter(Description(Substring("bar"))),
+            CommitRef(Symbol("foo")),
+            AsFilter(
+                Intersection(
+                    Filter(Description(Substring("bar"))),
+                    Filter(AuthorName(Substring("baz"))),
+                ),
             ),
-            Filter(AuthorName(Substring("baz"))),
         )
         "#);
         insta::assert_debug_snapshot!(
             optimize(parse("committer_name(foo) & bar & author_name(baz)").unwrap()), @r#"
         Intersection(
-            Intersection(
-                CommitRef(Symbol("bar")),
-                Filter(CommitterName(Substring("foo"))),
+            CommitRef(Symbol("bar")),
+            AsFilter(
+                Intersection(
+                    Filter(CommitterName(Substring("foo"))),
+                    Filter(AuthorName(Substring("baz"))),
+                ),
             ),
-            Filter(AuthorName(Substring("baz"))),
         )
         "#);
         insta::assert_debug_snapshot!(
@@ -3875,11 +4693,13 @@ mod tests {
                 WorkspaceName::DEFAULT).unwrap(),
             ), @r#"
         Intersection(
-            Intersection(
-                CommitRef(Symbol("baz")),
-                Filter(CommitterName(Substring("foo"))),
+            CommitRef(Symbol("baz")),
+            AsFilter(
+                Intersection(
+                    Filter(CommitterName(Substring("foo"))),
+                    Filter(File(Pattern(PrefixPath("bar")))),
+                ),
             ),
-            Filter(File(Pattern(PrefixPath("bar")))),
         )
         "#);
         insta::assert_debug_snapshot!(
@@ -3887,12 +4707,14 @@ mod tests {
                 "committer_name(foo) & files(bar) & author_name(baz)",
                 WorkspaceName::DEFAULT).unwrap(),
             ), @r#"
-        Intersection(
+        AsFilter(
             Intersection(
-                Filter(CommitterName(Substring("foo"))),
-                Filter(File(Pattern(PrefixPath("bar")))),
+                Intersection(
+                    Filter(CommitterName(Substring("foo"))),
+                    Filter(File(Pattern(PrefixPath("bar")))),
+                ),
+                Filter(AuthorName(Substring("baz"))),
             ),
-            Filter(AuthorName(Substring("baz"))),
         )
         "#);
         insta::assert_debug_snapshot!(
@@ -3913,13 +4735,15 @@ mod tests {
             optimize(parse("foo & description(bar) & author_name(baz) & qux").unwrap()), @r#"
         Intersection(
             Intersection(
-                Intersection(
-                    CommitRef(Symbol("foo")),
-                    CommitRef(Symbol("qux")),
-                ),
-                Filter(Description(Substring("bar"))),
+                CommitRef(Symbol("foo")),
+                CommitRef(Symbol("qux")),
             ),
-            Filter(AuthorName(Substring("baz"))),
+            AsFilter(
+                Intersection(
+                    Filter(Description(Substring("bar"))),
+                    Filter(AuthorName(Substring("baz"))),
+                ),
+            ),
         )
         "#);
         insta::assert_debug_snapshot!(
@@ -3964,18 +4788,20 @@ mod tests {
         Intersection(
             Intersection(
                 Intersection(
-                    Intersection(
-                        Intersection(
-                            CommitRef(Symbol("a")),
-                            CommitRef(Symbol("b")),
-                        ),
-                        CommitRef(Symbol("c")),
-                    ),
-                    Filter(AuthorName(Substring("A"))),
+                    CommitRef(Symbol("a")),
+                    CommitRef(Symbol("b")),
                 ),
-                Filter(AuthorName(Substring("B"))),
+                CommitRef(Symbol("c")),
             ),
-            Filter(AuthorName(Substring("C"))),
+            AsFilter(
+                Intersection(
+                    Intersection(
+                        Filter(AuthorName(Substring("A"))),
+                        Filter(AuthorName(Substring("B"))),
+                    ),
+                    Filter(AuthorName(Substring("C"))),
+                ),
+            ),
         )
         "#);
         insta::assert_debug_snapshot!(
@@ -3985,20 +4811,22 @@ mod tests {
             Intersection(
                 Intersection(
                     Intersection(
-                        Intersection(
-                            CommitRef(Symbol("a")),
-                            Intersection(
-                                CommitRef(Symbol("b")),
-                                CommitRef(Symbol("c")),
-                            ),
-                        ),
-                        CommitRef(Symbol("d")),
+                        CommitRef(Symbol("a")),
+                        CommitRef(Symbol("b")),
                     ),
-                    Filter(AuthorName(Substring("A"))),
+                    CommitRef(Symbol("c")),
                 ),
-                Filter(AuthorName(Substring("B"))),
+                CommitRef(Symbol("d")),
             ),
-            Filter(AuthorName(Substring("C"))),
+            AsFilter(
+                Intersection(
+                    Intersection(
+                        Filter(AuthorName(Substring("A"))),
+                        Filter(AuthorName(Substring("B"))),
+                    ),
+                    Filter(AuthorName(Substring("C"))),
+                ),
+            ),
         )
         "#);
 
@@ -4007,11 +4835,13 @@ mod tests {
             optimize(parse("foo & (all() & description(bar)) & (author_name(baz) & all())").unwrap()),
             @r#"
         Intersection(
-            Intersection(
-                CommitRef(Symbol("foo")),
-                Filter(Description(Substring("bar"))),
+            CommitRef(Symbol("foo")),
+            AsFilter(
+                Intersection(
+                    Filter(Description(Substring("bar"))),
+                    Filter(AuthorName(Substring("baz"))),
+                ),
             ),
-            Filter(AuthorName(Substring("baz"))),
         )
         "#);
 
@@ -4050,37 +4880,78 @@ mod tests {
         )
         "#);
 
+        // 'merges() & foo' can be evaluated independently
         insta::assert_debug_snapshot!(
-            optimize(parse("(foo | committer_name(bar)) & description(baz) & qux").unwrap()), @r#"
-        Intersection(
+            optimize(parse("merges() & foo | bar").unwrap()), @r#"
+        Union(
             Intersection(
-                CommitRef(Symbol("qux")),
-                AsFilter(
-                    Union(
-                        CommitRef(Symbol("foo")),
-                        Filter(CommitterName(Substring("bar"))),
+                CommitRef(Symbol("foo")),
+                Filter(ParentCount(2..4294967295)),
+            ),
+            CommitRef(Symbol("bar")),
+        )
+        "#);
+
+        // 'merges() & foo' can be evaluated independently, but 'conflicts()'
+        // can't. We'll need implicit 'all() & _' anyway.
+        insta::assert_debug_snapshot!(
+            optimize(parse("merges() & foo | conflicts()").unwrap()), @r#"
+        AsFilter(
+            Union(
+                Intersection(
+                    CommitRef(Symbol("foo")),
+                    Filter(ParentCount(2..4294967295)),
+                ),
+                Filter(HasConflict),
+            ),
+        )
+        "#);
+
+        // Nested filter intersection with union
+        insta::assert_debug_snapshot!(
+            optimize(parse("foo | conflicts() & merges() & signed()").unwrap()), @r#"
+        AsFilter(
+            Union(
+                CommitRef(Symbol("foo")),
+                Intersection(
+                    Intersection(
+                        Filter(HasConflict),
+                        Filter(ParentCount(2..4294967295)),
                     ),
+                    Filter(Signed),
                 ),
             ),
-            Filter(Description(Substring("baz"))),
         )
         "#);
 
         insta::assert_debug_snapshot!(
-            optimize(parse("(~present(author_name(foo) & bar) | baz) & qux").unwrap()), @r#"
+            optimize(parse("(foo | committer_name(bar)) & description(baz) & qux").unwrap()), @r#"
+        Intersection(
+            CommitRef(Symbol("qux")),
+            AsFilter(
+                Intersection(
+                    Union(
+                        CommitRef(Symbol("foo")),
+                        Filter(CommitterName(Substring("bar"))),
+                    ),
+                    Filter(Description(Substring("baz"))),
+                ),
+            ),
+        )
+        "#);
+
+        insta::assert_debug_snapshot!(
+            optimize(parse(
+                "(~present(author_name(foo) & description(bar)) | baz) & qux").unwrap()), @r#"
         Intersection(
             CommitRef(Symbol("qux")),
             AsFilter(
                 Union(
-                    AsFilter(
-                        NotIn(
-                            AsFilter(
-                                Present(
-                                    Intersection(
-                                        CommitRef(Symbol("bar")),
-                                        Filter(AuthorName(Substring("foo"))),
-                                    ),
-                                ),
+                    NotIn(
+                        Present(
+                            Intersection(
+                                Filter(AuthorName(Substring("foo"))),
+                                Filter(Description(Substring("bar"))),
                             ),
                         ),
                     ),
@@ -4098,31 +4969,27 @@ mod tests {
         Intersection(
             Intersection(
                 Intersection(
+                    CommitRef(Symbol("a")),
+                    CommitRef(Symbol("b")),
+                ),
+                CommitRef(Symbol("c")),
+            ),
+            AsFilter(
+                Intersection(
                     Intersection(
-                        Intersection(
-                            CommitRef(Symbol("a")),
-                            CommitRef(Symbol("b")),
-                        ),
-                        CommitRef(Symbol("c")),
-                    ),
-                    AsFilter(
                         Union(
                             Filter(AuthorName(Substring("A"))),
                             CommitRef(Symbol("0")),
                         ),
+                        Union(
+                            Filter(AuthorName(Substring("B"))),
+                            CommitRef(Symbol("1")),
+                        ),
                     ),
-                ),
-                AsFilter(
                     Union(
-                        Filter(AuthorName(Substring("B"))),
-                        CommitRef(Symbol("1")),
+                        Filter(AuthorName(Substring("C"))),
+                        CommitRef(Symbol("2")),
                     ),
-                ),
-            ),
-            AsFilter(
-                Union(
-                    Filter(AuthorName(Substring("C"))),
-                    CommitRef(Symbol("2")),
                 ),
             ),
         )
@@ -4288,6 +5155,306 @@ mod tests {
                 generation: 2..3,
             },
             heads: CommitRef(Symbol("bar")),
+        }
+        "#);
+    }
+
+    #[test]
+    fn test_optimize_flatten_intersection() {
+        let settings = insta_settings();
+        let _guard = settings.bind_to_scope();
+
+        // Nested intersections should be flattened.
+        insta::assert_debug_snapshot!(optimize(parse("a & ((b & c) & (d & e))").unwrap()), @r#"
+        Intersection(
+            Intersection(
+                Intersection(
+                    Intersection(
+                        CommitRef(Symbol("a")),
+                        CommitRef(Symbol("b")),
+                    ),
+                    CommitRef(Symbol("c")),
+                ),
+                CommitRef(Symbol("d")),
+            ),
+            CommitRef(Symbol("e")),
+        )
+        "#);
+    }
+
+    #[test]
+    fn test_optimize_ancestors_union() {
+        let settings = insta_settings();
+        let _guard = settings.bind_to_scope();
+
+        // Ancestors should be folded in unions.
+        insta::assert_debug_snapshot!(optimize(parse("::a | ::b | ::c | ::d").unwrap()), @r#"
+        Ancestors {
+            heads: Union(
+                Union(
+                    CommitRef(Symbol("a")),
+                    CommitRef(Symbol("b")),
+                ),
+                Union(
+                    CommitRef(Symbol("c")),
+                    CommitRef(Symbol("d")),
+                ),
+            ),
+            generation: 0..18446744073709551615,
+        }
+        "#);
+        insta::assert_debug_snapshot!(optimize(parse("ancestors(a-) | ancestors(b)").unwrap()), @r#"
+        Ancestors {
+            heads: Union(
+                Ancestors {
+                    heads: CommitRef(Symbol("a")),
+                    generation: 1..2,
+                },
+                CommitRef(Symbol("b")),
+            ),
+            generation: 0..18446744073709551615,
+        }
+        "#);
+
+        // Negated ancestors should be folded.
+        insta::assert_debug_snapshot!(optimize(parse("~::a- & ~::b & ~::c & ::d").unwrap()), @r#"
+        Range {
+            roots: Union(
+                Union(
+                    Ancestors {
+                        heads: CommitRef(Symbol("a")),
+                        generation: 1..2,
+                    },
+                    CommitRef(Symbol("b")),
+                ),
+                CommitRef(Symbol("c")),
+            ),
+            heads: CommitRef(Symbol("d")),
+            generation: 0..18446744073709551615,
+        }
+        "#);
+        insta::assert_debug_snapshot!(optimize(parse("a..b ~ ::c- ~ ::d").unwrap()), @r#"
+        Range {
+            roots: Union(
+                Union(
+                    CommitRef(Symbol("a")),
+                    Ancestors {
+                        heads: CommitRef(Symbol("c")),
+                        generation: 1..2,
+                    },
+                ),
+                CommitRef(Symbol("d")),
+            ),
+            heads: CommitRef(Symbol("b")),
+            generation: 0..18446744073709551615,
+        }
+        "#);
+
+        // Ancestors with a bounded generation range should not be merged.
+        insta::assert_debug_snapshot!(optimize(parse("ancestors(a, 2) | ancestors(b)").unwrap()), @r#"
+        Union(
+            Ancestors {
+                heads: CommitRef(Symbol("a")),
+                generation: 0..2,
+            },
+            Ancestors {
+                heads: CommitRef(Symbol("b")),
+                generation: 0..18446744073709551615,
+            },
+        )
+        "#);
+    }
+
+    #[test]
+    fn test_optimize_sort_negations_and_ancestors() {
+        let settings = insta_settings();
+        let _guard = settings.bind_to_scope();
+
+        // Negated ancestors and ancestors should be moved to the left, and other
+        // negations should be moved to the right.
+        insta::assert_debug_snapshot!(optimize(parse("~a & ::b & ~::c & d ~ e & f & ::g & ~::h").unwrap()), @r#"
+        Difference(
+            Difference(
+                Intersection(
+                    Intersection(
+                        Intersection(
+                            Range {
+                                roots: Union(
+                                    CommitRef(Symbol("c")),
+                                    CommitRef(Symbol("h")),
+                                ),
+                                heads: CommitRef(Symbol("b")),
+                                generation: 0..18446744073709551615,
+                            },
+                            Ancestors {
+                                heads: CommitRef(Symbol("g")),
+                                generation: 0..18446744073709551615,
+                            },
+                        ),
+                        CommitRef(Symbol("d")),
+                    ),
+                    CommitRef(Symbol("f")),
+                ),
+                CommitRef(Symbol("a")),
+            ),
+            CommitRef(Symbol("e")),
+        )
+        "#);
+    }
+
+    #[test]
+    fn test_optimize_heads_range() {
+        let settings = insta_settings();
+        let _guard = settings.bind_to_scope();
+
+        // Heads of basic range operators can be folded.
+        insta::assert_debug_snapshot!(optimize(parse("heads(::)").unwrap()), @r"
+        HeadsRange {
+            roots: None,
+            heads: VisibleHeadsOrReferenced,
+            filter: All,
+        }
+        ");
+        insta::assert_debug_snapshot!(optimize(parse("heads(::foo)").unwrap()), @r#"
+        HeadsRange {
+            roots: None,
+            heads: CommitRef(Symbol("foo")),
+            filter: All,
+        }
+        "#);
+        // It might be better to use `roots: Root`, but it would require adding a
+        // special case for `~root()`, and this should be similar in performance.
+        insta::assert_debug_snapshot!(optimize(parse("heads(..)").unwrap()), @r"
+        HeadsRange {
+            roots: None,
+            heads: VisibleHeadsOrReferenced,
+            filter: NotIn(Root),
+        }
+        ");
+        insta::assert_debug_snapshot!(optimize(parse("heads(foo..)").unwrap()), @r#"
+        HeadsRange {
+            roots: CommitRef(Symbol("foo")),
+            heads: VisibleHeadsOrReferenced,
+            filter: All,
+        }
+        "#);
+        insta::assert_debug_snapshot!(optimize(parse("heads(..bar)").unwrap()), @r#"
+        HeadsRange {
+            roots: Root,
+            heads: CommitRef(Symbol("bar")),
+            filter: All,
+        }
+        "#);
+        insta::assert_debug_snapshot!(optimize(parse("heads(foo..bar)").unwrap()), @r#"
+        HeadsRange {
+            roots: CommitRef(Symbol("foo")),
+            heads: CommitRef(Symbol("bar")),
+            filter: All,
+        }
+        "#);
+        insta::assert_debug_snapshot!(optimize(parse("heads(~::foo & ::bar)").unwrap()), @r#"
+        HeadsRange {
+            roots: CommitRef(Symbol("foo")),
+            heads: CommitRef(Symbol("bar")),
+            filter: All,
+        }
+        "#);
+        insta::assert_debug_snapshot!(optimize(parse("heads(~::foo)").unwrap()), @r#"
+        HeadsRange {
+            roots: CommitRef(Symbol("foo")),
+            heads: VisibleHeadsOrReferenced,
+            filter: All,
+        }
+        "#);
+        insta::assert_debug_snapshot!(optimize(parse("heads(a..b & c..d)").unwrap()), @r#"
+        HeadsRange {
+            roots: Union(
+                CommitRef(Symbol("a")),
+                CommitRef(Symbol("c")),
+            ),
+            heads: CommitRef(Symbol("b")),
+            filter: Ancestors {
+                heads: CommitRef(Symbol("d")),
+                generation: 0..18446744073709551615,
+            },
+        }
+        "#);
+
+        // Ancestors with a limited depth should not be optimized.
+        insta::assert_debug_snapshot!(optimize(parse("heads(ancestors(foo, 2))").unwrap()), @r#"
+        Heads(
+            Ancestors {
+                heads: CommitRef(Symbol("foo")),
+                generation: 0..2,
+            },
+        )
+        "#);
+
+        // Generation folding should not prevent optimizing heads.
+        insta::assert_debug_snapshot!(optimize(parse("heads(ancestors(foo--))").unwrap()), @r#"
+        HeadsRange {
+            roots: None,
+            heads: Ancestors {
+                heads: CommitRef(Symbol("foo")),
+                generation: 2..3,
+            },
+            filter: All,
+        }
+        "#);
+
+        // Heads of filters and negations can be folded.
+        insta::assert_debug_snapshot!(optimize(parse("heads(author_name(A) | author_name(B))").unwrap()), @r#"
+        HeadsRange {
+            roots: None,
+            heads: VisibleHeadsOrReferenced,
+            filter: AsFilter(
+                Union(
+                    Filter(AuthorName(Substring("A"))),
+                    Filter(AuthorName(Substring("B"))),
+                ),
+            ),
+        }
+        "#);
+        insta::assert_debug_snapshot!(optimize(parse("heads(~author_name(A))").unwrap()), @r#"
+        HeadsRange {
+            roots: None,
+            heads: VisibleHeadsOrReferenced,
+            filter: AsFilter(
+                NotIn(Filter(AuthorName(Substring("A")))),
+            ),
+        }
+        "#);
+        insta::assert_debug_snapshot!(optimize(parse("heads(~foo)").unwrap()), @r#"
+        HeadsRange {
+            roots: None,
+            heads: VisibleHeadsOrReferenced,
+            filter: NotIn(CommitRef(Symbol("foo"))),
+        }
+        "#);
+
+        // Heads of intersections with filters can be folded.
+        insta::assert_debug_snapshot!(optimize(parse("heads(author_name(A) & ::foo ~ author_name(B))").unwrap()), @r#"
+        HeadsRange {
+            roots: None,
+            heads: CommitRef(Symbol("foo")),
+            filter: AsFilter(
+                Difference(
+                    Filter(AuthorName(Substring("A"))),
+                    Filter(AuthorName(Substring("B"))),
+                ),
+            ),
+        }
+        "#);
+
+        // Heads of intersections with negations can be folded.
+        insta::assert_debug_snapshot!(optimize(parse("heads(~foo & ~roots(bar) & ::baz)").unwrap()), @r#"
+        HeadsRange {
+            roots: None,
+            heads: CommitRef(Symbol("baz")),
+            filter: Difference(
+                NotIn(CommitRef(Symbol("foo"))),
+                Roots(CommitRef(Symbol("bar"))),
+            ),
         }
         "#);
     }
